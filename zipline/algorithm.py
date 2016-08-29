@@ -1274,7 +1274,8 @@ class TradingAlgorithm(object):
             asset_finder=self.asset_finder,
             get_datetime=self.get_datetime,
             root_symbol=root_symbol,
-            as_of_date=as_of_date
+            as_of_date=as_of_date,
+            trading_calendar=self.trading_calendar,
         )
 
     def _calculate_order_value_amount(self, asset, value):

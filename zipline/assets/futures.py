@@ -1,5 +1,5 @@
 #
-# Copyright 2015 Quantopian, Inc.
+# Copyright 2016 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,11 @@
 # limitations under the License.
 
 from pandas import Timestamp, Timedelta
-from pandas.tseries.tools import normalize_date
 
 
 class FutureChain(object):
-    """ Allows users to look up future contracts.
+    """
+    Allows users to look up future contracts.
 
     Parameters
     ----------
@@ -30,6 +30,8 @@ class FutureChain(object):
         the get_datetime method of the TradingAlgorithm instance.
     root_symbol : str
         The root symbol of a future chain.
+    trading_calendar: zipline.utils.calendars.trading_calendar.TradingCalendar
+        The calendar to use for date calculations.
     as_of_date : pandas.Timestamp, optional
         Date at which the chain determination is rooted. I.e. the
         existing contract whose notice date is first after this date is
@@ -55,7 +57,7 @@ class FutureChain(object):
         a future chain could not be found.
     """
     def __init__(self, asset_finder, get_datetime, root_symbol,
-                 as_of_date=None):
+                 trading_calendar, as_of_date=None):
         self.root_symbol = root_symbol
 
         # Reference to the algo's AssetFinder for contract lookups
@@ -63,10 +65,14 @@ class FutureChain(object):
         # Reference to the algo's get_datetime to know the current dt
         self._algorithm_get_datetime = get_datetime
 
+        self._trading_calendar = trading_calendar
+
         # If an as_of_date is provided, self._as_of_date uses that
         # value, otherwise None. This attribute backs the as_of_date property.
         if as_of_date:
-            self._as_of_date = normalize_date(as_of_date)
+            self._as_of_date = self._trading_calendar.minute_to_session_label(
+                as_of_date
+            )
         else:
             self._as_of_date = None
 
@@ -88,19 +94,6 @@ class FutureChain(object):
         else:
             return "FutureChain(root_symbol='%s')" % self.root_symbol
 
-    def _get_datetime(self):
-        """
-        Returns the normalized simulation datetime.
-
-        Returns
-        -------
-        pandas.Timestamp
-            The normalized datetime of FutureChain's TradingAlgorithm.
-        """
-        return normalize_date(
-            Timestamp(self._algorithm_get_datetime(), tz='UTC')
-        )
-
     @property
     def as_of_date(self):
         """
@@ -115,16 +108,18 @@ class FutureChain(object):
         if self._as_of_date is not None:
             return self._as_of_date
         else:
-            return self._get_datetime()
+            return self._trading_calendar.minute_to_session_label(
+                self._algorithm_get_datetime()
+            )
 
     def _maybe_update_current_chain(self):
-        """ Updates the current chain if it's out of date, then returns
-            it.
+        """
+        Updates the current chain if it's out of date, then returns it.
 
-            Returns
-            -------
-            list
-                The up-to-date current chain, a list of Future objects.
+        Returns
+        -------
+        list
+            The up-to-date current chain, a list of Future objects.
         """
         if (self._last_updated is None)\
                 or (self._last_updated != self.as_of_date):
@@ -146,7 +141,8 @@ class FutureChain(object):
         return iter(self._maybe_update_current_chain())
 
     def as_of(self, dt):
-        """ Get the future chain for this root symbol as of a specific date.
+        """
+        Get the future chain for this root symbol as of a specific date.
 
         Parameters
         ----------
@@ -156,8 +152,9 @@ class FutureChain(object):
         Returns
         -------
         FutureChain
-
         """
+        import pdb; pdb.set_trace()
+
         return FutureChain(
             asset_finder=self._asset_finder,
             get_datetime=self._algorithm_get_datetime,
@@ -166,7 +163,8 @@ class FutureChain(object):
         )
 
     def offset(self, time_delta):
-        """ Get the future chain for this root symbol with a given
+        """
+        Get the future chain for this root symbol with a given
         offset from the current as_of_date.
 
         Parameters
@@ -177,7 +175,6 @@ class FutureChain(object):
         Returns
         -------
         FutureChain
-
         """
         return self.as_of(self.as_of_date + Timedelta(time_delta))
 
