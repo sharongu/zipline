@@ -15,11 +15,13 @@ from collections import OrderedDict
 from abc import ABCMeta, abstractmethod
 
 import numpy as np
+from numpy import nan
 import pandas as pd
 from pandas import DataFrame
 from six import with_metaclass
 
 from zipline.data.minute_bars import MinuteBarReader
+from zipline.data.us_equity_pricing import NoDataOnDate
 from zipline.data.session_bars import SessionBarReader
 from zipline.utils.memoize import lazyval
 
@@ -246,7 +248,7 @@ class DailyHistoryAggregator(object):
                             dt,
                             [asset],
                         )[0].T
-                        val = max(last_max, np.nanmax(window))
+                        val = np.nanmax(np.append(window, last_max))
                         entries[asset] = (dt_value, val)
                         highs.append(val)
                         continue
@@ -310,11 +312,7 @@ class DailyHistoryAggregator(object):
                             dt,
                             [asset],
                         )[0].T
-                        window_min = np.nanmin(window)
-                        if pd.isnull(window_min):
-                            val = last_min
-                        else:
-                            val = min(last_min, window_min)
+                        val = np.nanmin(np.append(window, last_min))
                         entries[asset] = (dt_value, val)
                         lows.append(val)
                         continue
@@ -584,15 +582,21 @@ class ReindexBarReader(with_metaclass(ABCMeta)):
         return self._reader.first_trading_day
 
     def get_value(self, sid, dt, field):
-        return self._reader.get_value(sid, dt, field)
+        try:
+            return self._reader.get_value(sid, dt, field)
+        except NoDataOnDate:
+            if field == 'volume':
+                return 0
+            else:
+                return nan
 
     @abstractmethod
     def _outer_dts(self, start_dt, end_dt):
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def _inner_dts(self, start_dt, end_dt):
-        pass
+        raise NotImplementedError
 
     @property
     def trading_calendar(self):
