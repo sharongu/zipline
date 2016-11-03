@@ -18,96 +18,47 @@ from abc import (
     abstractproperty,
 )
 
-from cachetools import LRUCache
-from numpy import around, hstack
+from numpy import concatenate
+from lru import LRU
+from pandas import isnull
 from pandas.tslib import normalize_date
+from toolz import sliding_window
 
 from six import with_metaclass
 
+from zipline.assets import Equity
+from zipline.assets.continuous_futures import ContinuousFuture
+from zipline.lib._int64window import AdjustedArrayWindow as Int64Window
 from zipline.lib._float64window import AdjustedArrayWindow as Float64Window
-from zipline.lib.adjustment import Float64Multiply
+from zipline.lib.adjustment import Float64Multiply, Float64Add
 from zipline.utils.cache import ExpiringCache
 from zipline.utils.memoize import lazyval
 from zipline.utils.numpy_utils import float64_dtype
 
 
-class SlidingWindow(object):
-    """
-    Wrapper around an AdjustedArrayWindow which supports monotonically
-    increasing (by datetime) requests for a sized window of data.
+class HistoryCompatibleUSEquityAdjustmentReader(object):
 
-    Parameters
-    ----------
-    window : AdjustedArrayWindow
-       Window of pricing data with prefetched values beyond the current
-       simulation dt.
-    cal_start : int
-       Index in the overall calendar at which the window starts.
-    """
+    def __init__(self, adjustment_reader):
+        self._adjustments_reader = adjustment_reader
 
-    def __init__(self, window, size, cal_start, offset):
-        self.window = window
-        self.cal_start = cal_start
-        self.current = around(next(window), 3)
-        self.offset = offset
-        self.most_recent_ix = self.cal_start + size
-
-    def get(self, end_ix):
+    def load_adjustments(self, columns, dts, assets):
         """
         Returns
         -------
-        out : A np.ndarray of the equity pricing up to end_ix after adjustments
-              and rounding have been applied.
+        adjustments : list[dict[int -> Adjustment]]
+            A list, where each element corresponds to the `columns`, of
+            mappings from index to adjustment objects to apply at that index.
         """
-        if self.most_recent_ix == end_ix:
-            return self.current
+        out = [None] * len(columns)
+        for i, column in enumerate(columns):
+            adjs = {}
+            for asset in assets:
+                adjs.update(self._get_adjustments_in_range(
+                    asset, dts, column))
+            out[i] = adjs
+        return out
 
-        target = end_ix - self.cal_start - self.offset + 1
-        self.current = around(self.window.seek(target), 3)
-
-        self.most_recent_ix = end_ix
-        return self.current
-
-
-class HistoryLoader(with_metaclass(ABCMeta)):
-    """
-    Loader for sliding history windows, with support for adjustments.
-
-    Parameters
-    ----------
-    trading_calendar: TradingCalendar
-        Contains the grouping logic needed to assign minutes to periods.
-    reader : DailyBarReader, MinuteBarReader
-        Reader for pricing bars.
-    adjustment_reader : SQLiteAdjustmentReader
-        Reader for adjustment data.
-    """
-    FIELDS = ('open', 'high', 'low', 'close', 'volume')
-
-    def __init__(self, trading_calendar, reader, adjustment_reader,
-                 sid_cache_size=1000):
-        self.trading_calendar = trading_calendar
-        self._reader = reader
-        self._adjustments_reader = adjustment_reader
-        self._window_blocks = {
-            field: ExpiringCache(LRUCache(maxsize=sid_cache_size))
-            for field in self.FIELDS
-        }
-
-    @abstractproperty
-    def _prefetch_length(self):
-        pass
-
-    @abstractproperty
-    def _calendar(self):
-        pass
-
-    @abstractmethod
-    def _array(self, start, end, assets, field):
-        pass
-
-    def _get_adjustments_in_range(self, asset, dts, field,
-                                  is_perspective_after):
+    def _get_adjustments_in_range(self, asset, dts, field):
         """
         Get the Float64Multiply objects to pass to an AdjustedArrayWindow.
 
@@ -126,20 +77,15 @@ class HistoryLoader(with_metaclass(ABCMeta)):
         ----------
         asset : Asset
             The assets for which to get adjustments.
-        days : iterable of datetime64-like
-            The days for which adjustment data is needed.
+        dts : iterable of datetime64-like
+            The dts for which adjustment data is needed.
         field : str
             OHLCV field for which to get the adjustments.
-        is_perspective_after : bool
-            see: `PricingHistoryLoader.history`
-            If True, the index at which the Multiply object is registered to
-            be popped is calculated so that it applies to the last slot in the
-            sliding window  when the adjustment occurs immediately after the dt
-            that slot represents.
 
         Returns
         -------
-        out : The adjustments as a dict of loc -> Float64Multiply
+        out : dict[loc -> Float64Multiply]
+            The adjustments as a dict of loc -> Float64Multiply
         """
         sid = int(asset)
         start = normalize_date(dts[0])
@@ -153,11 +99,6 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                 if start < dt <= end:
                     end_loc = dts.searchsorted(dt)
                     adj_loc = end_loc
-                    if is_perspective_after:
-                        # Set adjustment pop location so that it applies
-                        # to last value if adjustment occurs immediately after
-                        # the last slot.
-                        adj_loc -= 1
                     mult = Float64Multiply(0,
                                            end_loc - 1,
                                            0,
@@ -174,11 +115,6 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                 if start < dt <= end:
                     end_loc = dts.searchsorted(dt)
                     adj_loc = end_loc
-                    if is_perspective_after:
-                        # Set adjustment pop location so that it applies
-                        # to last value if adjustment occurs immediately after
-                        # the last slot.
-                        adj_loc -= 1
                     mult = Float64Multiply(0,
                                            end_loc - 1,
                                            0,
@@ -199,11 +135,6 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                     ratio = s[1]
                 end_loc = dts.searchsorted(dt)
                 adj_loc = end_loc
-                if is_perspective_after:
-                    # Set adjustment pop location so that it applies
-                    # to last value if adjustment occurs immediately after
-                    # the last slot.
-                    adj_loc -= 1
                 mult = Float64Multiply(0,
                                        end_loc - 1,
                                        0,
@@ -214,6 +145,204 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                 except KeyError:
                     adjs[adj_loc] = [mult]
         return adjs
+
+
+class ContinuousFutureAdjustmentReader(object):
+    """
+    Calculates adjustments for continuous futures, based on the
+    close and open of the contracts on the either side of each roll.
+    """
+
+    def __init__(self,
+                 trading_calendar,
+                 asset_finder,
+                 bar_reader,
+                 roll_finders,
+                 frequency):
+        self._trading_calendar = trading_calendar
+        self._asset_finder = asset_finder
+        self._bar_reader = bar_reader
+        self._roll_finders = roll_finders
+        self._frequency = frequency
+
+    def load_adjustments(self, columns, dts, assets):
+        """
+        Returns
+        -------
+        adjustments : list[dict[int -> Adjustment]]
+            A list, where each element corresponds to the `columns`, of
+            mappings from index to adjustment objects to apply at that index.
+        """
+        out = [None] * len(columns)
+        for i, column in enumerate(columns):
+            adjs = {}
+            for asset in assets:
+                adjs.update(self._get_adjustments_in_range(
+                    asset, dts, column))
+            out[i] = adjs
+        return out
+
+    def _make_adjustment(self,
+                         adjustment_type,
+                         front_close,
+                         back_close,
+                         end_loc):
+        adj_base = back_close - front_close
+        if adjustment_type == 'mul':
+            adj_value = 1.0 + adj_base / front_close
+            adj_class = Float64Multiply
+        elif adjustment_type == 'add':
+            adj_value = adj_base
+            adj_class = Float64Add
+        return adj_class(0,
+                         end_loc,
+                         0,
+                         0,
+                         adj_value)
+
+    def _get_adjustments_in_range(self, cf, dts, field):
+        if field == 'volume' or field == 'sid':
+            return {}
+        if cf.adjustment is None:
+            return {}
+        rf = self._roll_finders[cf.roll_style]
+        partitions = []
+
+        rolls = rf.get_rolls(cf.root_symbol, dts[0], dts[-1],
+                             cf.offset)
+
+        tc = self._trading_calendar
+
+        adjs = {}
+
+        for front, back in sliding_window(2, rolls):
+            front_sid, roll_dt = front
+            back_sid = back[0]
+            dt = tc.previous_session_label(roll_dt)
+            if self._frequency == 'minute':
+                dt = tc.open_and_close_for_session(dt)[1]
+                roll_dt = tc.open_and_close_for_session(roll_dt)[0]
+            partitions.append((front_sid,
+                               back_sid,
+                               dt,
+                               roll_dt))
+        for partition in partitions:
+            front_sid, back_sid, dt, roll_dt = partition
+            last_front_dt = self._bar_reader.get_last_traded_dt(
+                self._asset_finder.retrieve_asset(front_sid), dt)
+            last_back_dt = self._bar_reader.get_last_traded_dt(
+                self._asset_finder.retrieve_asset(back_sid), dt)
+            if isnull(last_front_dt) or isnull(last_back_dt):
+                continue
+            front_close = self._bar_reader.get_value(
+                front_sid, last_front_dt, 'close')
+            back_close = self._bar_reader.get_value(
+                back_sid, last_back_dt, 'close')
+            adj_loc = dts.searchsorted(roll_dt)
+            end_loc = adj_loc - 1
+            adj = self._make_adjustment(cf.adjustment,
+                                        front_close,
+                                        back_close,
+                                        end_loc)
+            try:
+                adjs[adj_loc].append(adj)
+            except KeyError:
+                adjs[adj_loc] = [adj]
+        return adjs
+
+
+class SlidingWindow(object):
+    """
+    Wrapper around an AdjustedArrayWindow which supports monotonically
+    increasing (by datetime) requests for a sized window of data.
+
+    Parameters
+    ----------
+    window : AdjustedArrayWindow
+       Window of pricing data with prefetched values beyond the current
+       simulation dt.
+    cal_start : int
+       Index in the overall calendar at which the window starts.
+    """
+
+    def __init__(self, window, size, cal_start, offset):
+        self.window = window
+        self.cal_start = cal_start
+        self.current = next(window)
+        self.offset = offset
+        self.most_recent_ix = self.cal_start + size
+
+    def get(self, end_ix):
+        """
+        Returns
+        -------
+        out : A np.ndarray of the equity pricing up to end_ix after adjustments
+              and rounding have been applied.
+        """
+        if self.most_recent_ix == end_ix:
+            return self.current
+
+        target = end_ix - self.cal_start - self.offset + 1
+        self.current = self.window.seek(target)
+
+        self.most_recent_ix = end_ix
+        return self.current
+
+
+class HistoryLoader(with_metaclass(ABCMeta)):
+    """
+    Loader for sliding history windows, with support for adjustments.
+
+    Parameters
+    ----------
+    trading_calendar: TradingCalendar
+        Contains the grouping logic needed to assign minutes to periods.
+    reader : DailyBarReader, MinuteBarReader
+        Reader for pricing bars.
+    adjustment_reader : SQLiteAdjustmentReader
+        Reader for adjustment data.
+    """
+    FIELDS = ('open', 'high', 'low', 'close', 'volume', 'sid')
+
+    def __init__(self, trading_calendar, reader, equity_adjustment_reader,
+                 asset_finder,
+                 roll_finders=None,
+                 sid_cache_size=1000):
+        self.trading_calendar = trading_calendar
+        self._asset_finder = asset_finder
+        self._reader = reader
+        self._adjustment_readers = {}
+        if equity_adjustment_reader is not None:
+            self._adjustment_readers[Equity] = \
+                HistoryCompatibleUSEquityAdjustmentReader(
+                    equity_adjustment_reader)
+        if roll_finders:
+            self._adjustment_readers[ContinuousFuture] =\
+                ContinuousFutureAdjustmentReader(trading_calendar,
+                                                 asset_finder,
+                                                 reader,
+                                                 roll_finders,
+                                                 self._frequency)
+        self._window_blocks = {
+            field: ExpiringCache(LRU(sid_cache_size))
+            for field in self.FIELDS
+        }
+
+    @abstractproperty
+    def _frequency(self):
+        pass
+
+    @abstractproperty
+    def _prefetch_length(self):
+        pass
+
+    @abstractproperty
+    def _calendar(self):
+        pass
+
+    @abstractmethod
+    def _array(self, start, end, assets, field):
+        pass
 
     def _ensure_sliding_windows(self, assets, dts, field,
                                 is_perspective_after):
@@ -250,6 +379,8 @@ class HistoryLoader(with_metaclass(ABCMeta)):
         asset_windows = {}
         needed_assets = []
 
+        assets = self._asset_finder.retrieve_all(assets)
+
         for asset in assets:
             try:
                 asset_windows[asset] = self._window_blocks[field].get(
@@ -261,31 +392,50 @@ class HistoryLoader(with_metaclass(ABCMeta)):
             start = dts[0]
 
             offset = 0
-            start_ix = self._calendar.get_loc(start)
-            end_ix = self._calendar.get_loc(end)
-
+            try:
+                start_ix = self._calendar.get_loc(start)
+            except KeyError:
+                raise KeyError("{0} not in calendar [{1}...{2}]".format(
+                    start, self._calendar[0], self._calendar[-1]))
+            try:
+                end_ix = self._calendar.get_loc(end)
+            except KeyError:
+                raise KeyError("{0} not in calendar [{1}...{2}]".format(
+                    end, self._calendar[0], self._calendar[-1]))
             cal = self._calendar
             prefetch_end_ix = min(end_ix + self._prefetch_length, len(cal) - 1)
             prefetch_end = cal[prefetch_end_ix]
             prefetch_dts = cal[start_ix:prefetch_end_ix + 1]
             prefetch_len = len(prefetch_dts)
             array = self._array(prefetch_dts, needed_assets, field)
+
+            if field == 'sid':
+                window_type = Int64Window
+            else:
+                window_type = Float64Window
+
             view_kwargs = {}
             if field == 'volume':
                 array = array.astype(float64_dtype)
 
             for i, asset in enumerate(needed_assets):
-                if self._adjustments_reader:
-                    adjs = self._get_adjustments_in_range(
-                        asset, prefetch_dts, field, is_perspective_after)
+                adj_reader = None
+                try:
+                    adj_reader = self._adjustment_readers[type(asset)]
+                except KeyError:
+                    adj_reader = None
+                if adj_reader is not None:
+                    adjs = adj_reader.load_adjustments(
+                        [field], prefetch_dts, [asset])[0]
                 else:
                     adjs = {}
-                window = Float64Window(
+                window = window_type(
                     array[:, i].reshape(prefetch_len, 1),
                     view_kwargs,
                     adjs,
                     offset,
-                    size
+                    size,
+                    int(is_perspective_after)
                 )
                 sliding_window = SlidingWindow(window, size, start_ix, offset)
                 asset_windows[asset] = sliding_window
@@ -376,10 +526,18 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                                              field,
                                              is_perspective_after)
         end_ix = self._calendar.get_loc(dts[-1])
-        return hstack([window.get(end_ix) for window in block])
+
+        return concatenate(
+            [window.get(end_ix) for window in block],
+            axis=1,
+        ).round(3)
 
 
 class DailyHistoryLoader(HistoryLoader):
+
+    @property
+    def _frequency(self):
+        return 'daily'
 
     @property
     def _prefetch_length(self):
@@ -399,6 +557,10 @@ class DailyHistoryLoader(HistoryLoader):
 
 
 class MinuteHistoryLoader(HistoryLoader):
+
+    @property
+    def _frequency(self):
+        return 'minute'
 
     @property
     def _prefetch_length(self):

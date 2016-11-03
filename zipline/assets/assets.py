@@ -13,9 +13,12 @@
 # limitations under the License.
 
 from abc import ABCMeta
+import array
+import binascii
 from collections import namedtuple
 from numbers import Integral
 from operator import itemgetter, attrgetter
+import struct
 
 from logbook import Logger
 import numpy as np
@@ -40,13 +43,13 @@ from zipline.errors import (
     FutureContractsNotFound,
     MapAssetIdentifierIndexError,
     MultipleSymbolsFound,
-    RootSymbolNotFound,
     SidsNotFound,
     SymbolNotFound,
 )
 from . import (
     Asset, Equity, Future,
 )
+from . continuous_futures import OrderedContracts, ContinuousFuture
 from .asset_writer import (
     check_version_info,
     split_delimited_symbol,
@@ -120,6 +123,53 @@ def _convert_asset_timestamp_fields(dict_):
     return dict_
 
 
+SID_TYPE_IDS = {
+    # Asset would be 0,
+    ContinuousFuture: 1,
+}
+
+CONTINUOUS_FUTURE_ROLL_STYLE_IDS = {
+    'calendar': 0,
+    'volume': 1,
+}
+
+CONTINUOUS_FUTURE_ADJUSTMENT_STYLE_IDS = {
+    None: 0,
+    'div': 1,
+    'add': 2,
+}
+
+
+def _encode_continuous_future_sid(root_symbol,
+                                  offset,
+                                  roll_style,
+                                  adjustment_style):
+    s = struct.Struct("B 2B B B B 2B")
+    # B - sid type
+    # 2B - root symbol
+    # B - offset (could be packed smaller since offsets of greater than 12 are
+    #             probably unneeded.)
+    # B - roll type
+    # B - adjustment
+    # 2B - empty space left for parameterized roll types
+
+    # The root symbol currently supports 2 characters.  If 3 char root symbols
+    # are needed, the size of the root symbol does not need to change, however
+    # writing the string directly will need to change to a scheme of writing
+    # the A-Z values in 5-bit chunks.
+    a = array.array('B', [0] * s.size)
+    rs = bytearray(root_symbol, 'ascii')
+    values = (SID_TYPE_IDS[ContinuousFuture],
+              rs[0],
+              rs[1],
+              offset,
+              CONTINUOUS_FUTURE_ROLL_STYLE_IDS[roll_style],
+              CONTINUOUS_FUTURE_ADJUSTMENT_STYLE_IDS[adjustment_style],
+              0, 0)
+    s.pack_into(a, 0, *values)
+    return int(binascii.hexlify(a), 16)
+
+
 class AssetFinder(object):
     """
     An AssetFinder is an interface to a database of Asset metadata written by
@@ -162,6 +212,8 @@ class AssetFinder(object):
         # The caches are read through, i.e. accessing an asset through
         # retrieve_asset will populate the cache on first retrieval.
         self._caches = (self._asset_cache, self._asset_type_cache) = {}, {}
+
+        self._ordered_contracts = {}
 
         # Populated on first call to `lifetimes`.
         self._asset_lifetimes = None
@@ -311,7 +363,13 @@ class AssetFinder(object):
         """
         Retrieve the Asset for a given sid.
         """
-        return self.retrieve_all((sid,), default_none=default_none)[0]
+        try:
+            asset = self._asset_cache[sid]
+            if asset is None and not default_none:
+                raise SidsNotFound(sids=[sid])
+            return asset
+        except KeyError:
+            return self.retrieve_all((sid,), default_none=default_none)[0]
 
     def retrieve_all(self, sids, default_none=False):
         """
@@ -640,33 +698,35 @@ class AssetFinder(object):
                 options=set(options),
             )
 
-        options = []
+        options = {}
         for start, end, sid, sym in owners:
             if start <= as_of_date < end:
                 # see which fuzzy symbols were owned on the asof date.
-                options.append((sid, sym))
+                options[sid] = sym
 
         if not options:
             # no equity owned the fuzzy symbol on the date requested
-            SymbolNotFound(symbol=symbol)
+            raise SymbolNotFound(symbol=symbol)
 
+        sid_keys = list(options.keys())
+        # If there was only one owner, or there is a fuzzy and non-fuzzy which
+        # map to the same sid, return it.
         if len(options) == 1:
-            # there was only one owner, return it
-            return self.retrieve_asset(options[0][0])
+            return self.retrieve_asset(sid_keys[0])
 
-        for sid, sym in options:
-            if sym == symbol:
-                # look for an exact match on the asof date
+        for sid, sym in options.items():
+            # Possible to have a scenario where multiple fuzzy matches have the
+            # same date. Want to find the one where symbol and share class
+            # match.
+            if (company_symbol, share_class_symbol) == \
+                    split_delimited_symbol(sym):
                 return self.retrieve_asset(sid)
 
         # multiple equities held tickers matching the fuzzy ticker but
         # there are no exact matches
         raise MultipleSymbolsFound(
             symbol=symbol,
-            options=set(map(
-                compose(self.retrieve_asset, itemgetter(0)),
-                options,
-            )),
+            options=[self.retrieve_asset(s) for s in sid_keys],
         )
 
     def lookup_symbol(self, symbol, as_of_date, fuzzy=False):
@@ -703,6 +763,10 @@ class AssetFinder(object):
             there are multiple candidates for the given ``symbol`` on the
             ``as_of_date``.
         """
+        if symbol is None:
+            raise TypeError("Cannot lookup asset for symbol of None for "
+                            "as of date %s." % as_of_date)
+
         if fuzzy:
             return self._lookup_symbol_fuzzy(symbol, as_of_date)
         return self._lookup_symbol_strict(symbol, as_of_date)
@@ -734,62 +798,6 @@ class AssetFinder(object):
         if not data:
             raise SymbolNotFound(symbol=symbol)
         return self.retrieve_asset(data['sid'])
-
-    def lookup_future_chain(self, root_symbol, as_of_date):
-        """ Return the futures chain for a given root symbol.
-
-        Parameters
-        ----------
-        root_symbol : str
-            Root symbol of the desired future.
-
-        as_of_date : pd.Timestamp or pd.NaT
-            Date at which the chain determination is rooted. I.e. the
-            existing contract whose notice date/expiration date is first
-            after this date is the primary contract, etc. If NaT is
-            given, the chain is unbounded, and all contracts for this
-            root symbol are returned.
-
-        Returns
-        -------
-        list
-            A list of Future objects, the chain for the given
-            parameters.
-
-        Raises
-        ------
-        RootSymbolNotFound
-            Raised when a future chain could not be found for the given
-            root symbol.
-        """
-        fc_cols = self.futures_contracts.c
-
-        if as_of_date is pd.NaT:
-            # If the as_of_date is NaT, get all contracts for this
-            # root symbol.
-            sids = list(map(
-                itemgetter('sid'),
-                sa.select((fc_cols.sid,)).where(
-                    (fc_cols.root_symbol == root_symbol),
-                ).order_by(
-                    fc_cols.notice_date.asc(),
-                ).execute().fetchall()))
-        else:
-            sids = self._get_future_sids_for_root_symbol(
-                root_symbol,
-                as_of_date.value
-            )
-
-        if not sids:
-            # Check if root symbol exists.
-            count = sa.select((sa.func.count(fc_cols.sid),)).where(
-                fc_cols.root_symbol == root_symbol,
-            ).scalar()
-            if count == 0:
-                raise RootSymbolNotFound(root_symbol=root_symbol)
-
-        contracts = self.retrieve_futures_contracts(sids)
-        return [contracts[sid] for sid in sids]
 
     @weak_lru_cache(100)
     def _get_future_sids_for_root_symbol(self, root_symbol, as_of_date_ns):
@@ -871,6 +879,93 @@ class AssetFinder(object):
         ))
 
         return sids
+
+    def _get_contract_info(self, root_symbol):
+        fc_cols = self.futures_contracts.c
+
+        fields = (fc_cols.sid, fc_cols.start_date, fc_cols.auto_close_date)
+
+        return list(sa.select(fields).where(
+            (fc_cols.root_symbol == root_symbol) &
+            (fc_cols.start_date != pd.NaT.value))
+            .order_by(fc_cols.auto_close_date).execute().fetchall())
+
+    def _get_root_symbol_exchange(self, root_symbol):
+        fc_cols = self.futures_root_symbols.c
+
+        fields = (fc_cols.exchange,)
+
+        return sa.select(fields).where(
+            fc_cols.root_symbol == root_symbol).execute().fetchone()[0]
+
+    def get_ordered_contracts(self, root_symbol):
+        try:
+            return self._ordered_contracts[root_symbol]
+        except KeyError:
+            contract_info = self._get_contract_info(root_symbol)
+            size = len(contract_info)
+            sids = np.full(size, 0, dtype=np.int64)
+            start_dates = np.full(size, 0, dtype=np.int64)
+            auto_close_dates = np.full(size, 0, dtype=np.int64)
+            self._size = size
+            for i, info in enumerate(contract_info):
+                sid, start_date, auto_close_date = info
+                sids[i] = sid
+                start_dates[i] = start_date
+                auto_close_dates[i] = auto_close_date
+            oc = OrderedContracts(root_symbol,
+                                  sids,
+                                  start_dates,
+                                  auto_close_dates)
+            self._ordered_contracts[root_symbol] = oc
+            return oc
+
+    def create_continuous_future(self, root_symbol, offset, roll_style):
+        oc = self.get_ordered_contracts(root_symbol)
+        start_date = self.retrieve_asset(oc.contract_sids[0]).start_date
+        end_date = self.retrieve_asset(oc.contract_sids[-1]).end_date
+        exchange = self._get_root_symbol_exchange(root_symbol)
+
+        sid = _encode_continuous_future_sid(root_symbol, offset,
+                                            roll_style,
+                                            None)
+        mul_sid = _encode_continuous_future_sid(root_symbol, offset,
+                                                roll_style,
+                                                'div')
+        add_sid = _encode_continuous_future_sid(root_symbol, offset,
+                                                roll_style,
+                                                'add')
+        mul_cf = ContinuousFuture(mul_sid,
+                                  root_symbol,
+                                  offset,
+                                  roll_style,
+                                  start_date,
+                                  end_date,
+                                  exchange,
+                                  'mul')
+        add_cf = ContinuousFuture(add_sid,
+                                  root_symbol,
+                                  offset,
+                                  roll_style,
+                                  start_date,
+                                  end_date,
+                                  exchange,
+                                  'add')
+        cf = ContinuousFuture(sid,
+                              root_symbol,
+                              offset,
+                              roll_style,
+                              start_date,
+                              end_date,
+                              exchange,
+                              adjustment_children={
+                                  'mul': mul_cf,
+                                  'add': add_cf
+                              })
+        self._asset_cache[cf.sid] = cf
+        self._asset_cache[add_cf.sid] = add_cf
+        self._asset_cache[mul_cf.sid] = mul_cf
+        return cf
 
     def _make_sids(tblattr):
         def _(self):

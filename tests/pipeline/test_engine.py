@@ -14,6 +14,7 @@ from numpy import (
     float32,
     float64,
     full,
+    full_like,
     log,
     nan,
     tile,
@@ -25,12 +26,8 @@ from pandas import (
     Categorical,
     DataFrame,
     date_range,
-    ewma,
-    ewmstd,
     Int64Index,
     MultiIndex,
-    rolling_apply,
-    rolling_mean,
     Series,
     Timestamp,
 )
@@ -70,10 +67,12 @@ from zipline.pipeline.term import InputDates
 from zipline.testing import (
     AssetID,
     AssetIDPlusDay,
+    ExplodingObject,
     check_arrays,
     make_alternating_boolean_array,
     make_cascading_boolean_array,
     OpenPrice,
+    parameter_space,
     product_upper_triangle,
 )
 from zipline.testing.fixtures import (
@@ -82,6 +81,7 @@ from zipline.testing.fixtures import (
     WithTradingEnvironment,
     ZiplineTestCase,
 )
+from zipline.testing.predicates import assert_equal
 from zipline.utils.memoize import lazyval
 from zipline.utils.numpy_utils import bool_dtype, datetime64ns_dtype
 
@@ -167,14 +167,14 @@ class RollingSumSum(CustomFactor):
         out[:] = sum(inputs).sum(axis=0)
 
 
-class ConstantInputTestCase(WithTradingEnvironment, ZiplineTestCase):
+class WithConstantInputs(WithTradingEnvironment):
     asset_ids = ASSET_FINDER_EQUITY_SIDS = 1, 2, 3, 4
     START_DATE = Timestamp('2014-01-01', tz='utc')
     END_DATE = Timestamp('2014-03-01', tz='utc')
 
     @classmethod
     def init_class_fixtures(cls):
-        super(ConstantInputTestCase, cls).init_class_fixtures()
+        super(WithConstantInputs, cls).init_class_fixtures()
         cls.constants = {
             # Every day, assume every stock starts at 2, goes down to 1,
             # goes up to 4, and finishes at 3.
@@ -196,6 +196,8 @@ class ConstantInputTestCase(WithTradingEnvironment, ZiplineTestCase):
         )
         cls.assets = cls.asset_finder.retrieve_all(cls.asset_ids)
 
+
+class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
     def test_bad_dates(self):
         loader = self.loader
         engine = SimplePipelineEngine(
@@ -1008,15 +1010,17 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         # Shift back the raw inputs by a trading day because we expect our
         # computed results to be computed using values anchored on the
         # **previous** day's data.
-        expected_raw = rolling_mean(
+        expected_raw = DataFrame(
             expected_bar_values_2d(
                 dates - self.trading_calendar.day,
                 self.equity_info,
                 'close',
             ),
+        ).rolling(
             window_length,
             min_periods=1,
-        )
+        ).mean(
+        ).values
 
         expected = DataFrame(
             # Truncate off the extra rows needed to compute the SMAs.
@@ -1122,19 +1126,31 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
     def expected_ewma(self, window_length, decay_rate):
         alpha = 1 - decay_rate
         span = (2 / alpha) - 1
-        return rolling_apply(
-            self.raw_data,
-            window_length,
-            lambda window: ewma(window, span=span)[-1],
+
+        # XXX: This is a comically inefficient way to compute a windowed EWMA.
+        # Don't use it outside of testing.  We're using rolling-apply of an
+        # ewma (which is itself a rolling-window function) because we only want
+        # to look at ``window_length`` rows at a time.
+        return self.raw_data.rolling(window_length).apply(
+            lambda subarray: (DataFrame(subarray)
+                              .ewm(span=span)
+                              .mean()
+                              .values[-1])
         )[window_length:]
 
     def expected_ewmstd(self, window_length, decay_rate):
         alpha = 1 - decay_rate
         span = (2 / alpha) - 1
-        return rolling_apply(
-            self.raw_data,
-            window_length,
-            lambda window: ewmstd(window, span=span)[-1],
+
+        # XXX: This is a comically inefficient way to compute a windowed
+        # EWMSTD.  Don't use it outside of testing.  We're using rolling-apply
+        # of an ewma (which is itself a rolling-window function) because we
+        # only want to look at ``window_length`` rows at a time.
+        return self.raw_data.rolling(window_length).apply(
+            lambda subarray: (DataFrame(subarray)
+                              .ewm(span=span)
+                              .std()
+                              .values[-1])
         )[window_length:]
 
     @parameterized.expand([
@@ -1259,7 +1275,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
         expected_1 = (self.raw_data[5:] ** 2) * 2
         assert_frame_equal(results['dv1'].unstack(), expected_1)
 
-        expected_5 = rolling_mean((self.raw_data ** 2) * 2, window=5)[5:]
+        expected_5 = ((self.raw_data ** 2) * 2).rolling(5).mean()[5:]
         assert_frame_equal(results['dv5'].unstack(), expected_5)
 
         # The following two use USEquityPricing.open and .volume as inputs.
@@ -1269,9 +1285,11 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
                           * self.raw_data[5:] * 2).fillna(0)
         assert_frame_equal(results['dv1_nan'].unstack(), expected_1_nan)
 
-        expected_5_nan = rolling_mean((self.raw_data_with_nans
-                                       * self.raw_data * 2).fillna(0),
-                                      window=5)[5:]
+        expected_5_nan = ((self.raw_data_with_nans * self.raw_data * 2)
+                          .fillna(0)
+                          .rolling(5).mean()
+                          [5:])
+
         assert_frame_equal(results['dv5_nan'].unstack(), expected_5_nan)
 
 
@@ -1303,3 +1321,179 @@ class StringColumnTestCase(WithSeededRandomPipelineEngine,
             columns=self.asset_finder.retrieve_all(self.asset_finder.sids),
         )
         assert_frame_equal(result.c.unstack(), expected_final_result)
+
+
+class WindowSafetyPropagationTestCase(WithSeededRandomPipelineEngine,
+                                      ZiplineTestCase):
+
+    SEEDED_RANDOM_PIPELINE_SEED = 5
+
+    def test_window_safety_propagation(self):
+        dates = self.trading_days[-30:]
+        start_date, end_date = dates[[-10, -1]]
+
+        col = TestingDataSet.float_col
+        pipe = Pipeline(
+            columns={
+                'average_of_rank_plus_one': SimpleMovingAverage(
+                    inputs=[col.latest.rank() + 1],
+                    window_length=10,
+                ),
+                'average_of_aliased_rank_plus_one': SimpleMovingAverage(
+                    inputs=[col.latest.rank().alias('some_alias') + 1],
+                    window_length=10,
+                ),
+                'average_of_rank_plus_one_aliased': SimpleMovingAverage(
+                    inputs=[(col.latest.rank() + 1).alias('some_alias')],
+                    window_length=10,
+                ),
+            }
+        )
+        results = self.run_pipeline(pipe, start_date, end_date).unstack()
+
+        expected_ranks = DataFrame(
+            self.raw_expected_values(
+                col,
+                dates[-19],
+                dates[-1],
+            ),
+            index=dates[-19:],
+            columns=self.asset_finder.retrieve_all(
+                self.ASSET_FINDER_EQUITY_SIDS,
+            )
+        ).rank(axis='columns')
+
+        # All three expressions should be equivalent and evaluate to this.
+        expected_result = (
+            (expected_ranks + 1)
+            .rolling(10)
+            .mean()
+            .dropna(how='any')
+        )
+
+        for colname in results.columns.levels[0]:
+            assert_equal(expected_result, results[colname])
+
+
+class PopulateInitialWorkspaceTestCase(WithConstantInputs, ZiplineTestCase):
+
+    @parameter_space(window_length=[3, 5], pipeline_length=[5, 10])
+    def test_populate_initial_workspace(self, window_length, pipeline_length):
+        column = USEquityPricing.low
+        base_term = column.latest
+
+        # Take a Z-Score here so that the precomputed term is window-safe.  The
+        # z-score will never actually get computed because we swap it out.
+        precomputed_term = (base_term.zscore()).alias('precomputed_term')
+
+        # A term that has `precomputed_term` as an input.
+        depends_on_precomputed_term = precomputed_term + 1
+        # A term that requires a window of `precomputed_term`.
+        depends_on_window_of_precomputed_term = SimpleMovingAverage(
+            inputs=[precomputed_term],
+            window_length=window_length,
+        )
+
+        precomputed_term_with_window = SimpleMovingAverage(
+            inputs=(column,),
+            window_length=window_length,
+        ).alias('precomputed_term_with_window')
+        depends_on_precomputed_term_with_window = (
+            precomputed_term_with_window + 1
+        )
+
+        column_value = self.constants[column]
+        precomputed_term_value = -column_value
+        precomputed_term_with_window_value = -(column_value + 1)
+
+        def populate_initial_workspace(initial_workspace,
+                                       root_mask_term,
+                                       execution_plan,
+                                       dates,
+                                       assets):
+            def shape_for_term(term):
+                ndates = len(execution_plan.mask_and_dates_for_term(
+                    term,
+                    root_mask_term,
+                    initial_workspace,
+                    dates,
+                )[1])
+                nassets = len(assets)
+                return (ndates, nassets)
+
+            ws = initial_workspace.copy()
+            ws[precomputed_term] = full(
+                shape_for_term(precomputed_term),
+                precomputed_term_value,
+                dtype=float64,
+            )
+            ws[precomputed_term_with_window] = full(
+                shape_for_term(precomputed_term_with_window),
+                precomputed_term_with_window_value,
+                dtype=float64,
+            )
+            return ws
+
+        def dispatcher(c):
+            if c is column:
+                # the base_term should never be loaded, its initial refcount
+                # should be zero
+                return ExplodingObject()
+            return self.loader
+
+        engine = SimplePipelineEngine(
+            dispatcher,
+            self.dates,
+            self.asset_finder,
+            populate_initial_workspace=populate_initial_workspace,
+        )
+
+        results = engine.run_pipeline(
+            Pipeline({
+                'precomputed_term': precomputed_term,
+                'precomputed_term_with_window': precomputed_term_with_window,
+                'depends_on_precomputed_term': depends_on_precomputed_term,
+                'depends_on_precomputed_term_with_window':
+                    depends_on_precomputed_term_with_window,
+                'depends_on_window_of_precomputed_term':
+                    depends_on_window_of_precomputed_term,
+            }),
+            self.dates[-pipeline_length],
+            self.dates[-1],
+        )
+
+        assert_equal(
+            results['precomputed_term'].values,
+            full_like(
+                results['precomputed_term'],
+                precomputed_term_value,
+            ),
+        ),
+        assert_equal(
+            results['precomputed_term_with_window'].values,
+            full_like(
+                results['precomputed_term_with_window'],
+                precomputed_term_with_window_value,
+            ),
+        ),
+        assert_equal(
+            results['depends_on_precomputed_term'].values,
+            full_like(
+                results['depends_on_precomputed_term'],
+                precomputed_term_value + 1,
+            ),
+        )
+        assert_equal(
+            results['depends_on_precomputed_term_with_window'].values,
+            full_like(
+                results['depends_on_precomputed_term_with_window'],
+                precomputed_term_with_window_value + 1,
+            ),
+        )
+        assert_equal(
+            results['depends_on_window_of_precomputed_term'].values,
+            full_like(
+                results['depends_on_window_of_precomputed_term'],
+                precomputed_term_value,
+            ),
+        )

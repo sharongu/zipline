@@ -24,13 +24,16 @@ from numpy import (
     sum as np_sum
 )
 from numpy.random import randn, seed as random_seed
+import pandas as pd
 
 from zipline.errors import BadPercentileBounds
-from zipline.pipeline import Filter, Factor
+from zipline.pipeline import Filter, Factor, Pipeline
 from zipline.pipeline.classifiers import Classifier
 from zipline.pipeline.factors import CustomFactor
-from zipline.pipeline.filters import All, Any, AtLeastN
-from zipline.testing import parameter_space, permute_rows
+from zipline.pipeline.filters import All, Any, AtLeastN, StaticAssets
+from zipline.testing import parameter_space, permute_rows, ZiplineTestCase
+from zipline.testing.fixtures import WithSeededRandomPipelineEngine
+from zipline.testing.predicates import assert_equal
 from zipline.utils.numpy_utils import float64_dtype, int64_dtype
 from .base import BasePipelineTestCase, with_default_shape
 
@@ -819,4 +822,76 @@ class FilterTestCase(BasePipelineTestCase):
                                           dtype=bool),
             },
             mask=self.build_mask(permute(rot90(self.eye_mask(shape=shape)))),
+        )
+
+
+class SpecificAssetsTestCase(WithSeededRandomPipelineEngine,
+                             ZiplineTestCase):
+
+    ASSET_FINDER_EQUITY_SIDS = tuple(range(10))
+
+    def test_specific_assets(self):
+        assets = self.asset_finder.retrieve_all(self.ASSET_FINDER_EQUITY_SIDS)
+
+        class SidFactor(CustomFactor):
+            """A factor that just returns each asset's sid."""
+            inputs = ()
+            window_length = 1
+
+            def compute(self, today, sids, out):
+                out[:] = sids
+
+        pipe = Pipeline(
+            columns={
+                'sid': SidFactor(),
+                'evens': StaticAssets(assets[::2]),
+                'odds': StaticAssets(assets[1::2]),
+                'first_five': StaticAssets(assets[:5]),
+                'last_three': StaticAssets(assets[-3:]),
+            },
+        )
+
+        start, end = self.trading_days[[-10, -1]]
+        results = self.run_pipeline(pipe, start, end).unstack()
+
+        sids = results.sid.astype(int64_dtype)
+
+        assert_equal(results.evens, ~(sids % 2).astype(bool))
+        assert_equal(results.odds, (sids % 2).astype(bool))
+        assert_equal(results.first_five, sids < 5)
+        assert_equal(results.last_three, sids >= 7)
+
+
+class TestPostProcessAndToWorkSpaceValue(ZiplineTestCase):
+    def test_reversability(self):
+        class F(Filter):
+            inputs = ()
+            window_length = 0
+            missing_value = False
+
+        f = F()
+        column_data = array(
+            [[True, f.missing_value],
+             [True, f.missing_value],
+             [True, True]],
+            dtype=bool,
+        )
+
+        assert_equal(f.postprocess(column_data.ravel()), column_data.ravel())
+
+        # only include the non-missing data
+        pipeline_output = pd.Series(
+            data=True,
+            index=pd.MultiIndex.from_arrays([
+                [pd.Timestamp('2014-01-01'),
+                 pd.Timestamp('2014-01-02'),
+                 pd.Timestamp('2014-01-03'),
+                 pd.Timestamp('2014-01-03')],
+                [0, 0, 0, 1],
+            ]),
+        )
+
+        assert_equal(
+            f.to_workspace_value(pipeline_output, pd.Index([0, 1])),
+            column_data,
         )

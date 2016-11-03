@@ -20,16 +20,17 @@ from pandas.tslib import normalize_date
 import pandas as pd
 import numpy as np
 
-from six import iteritems, PY2
+from six import iteritems, PY2, string_types
 from cpython cimport bool
 from collections import Iterable
 
 from zipline.assets import Asset, Future
+from zipline.assets.continuous_futures import ContinuousFuture
 from zipline.zipline_warnings import ZiplineDeprecationWarning
 
 
 cdef bool _is_iterable(obj):
-    return isinstance(obj, Iterable) and not isinstance(obj, str)
+    return isinstance(obj, Iterable) and not isinstance(obj, string_types)
 
 
 # Wraps doesn't work for method objects in python2. Docs should be generated
@@ -153,6 +154,9 @@ cdef class BarData:
     data_frequency : {'minute', 'daily'}
         The frequency of the bar data; i.e. whether the data is
         daily or minute bars
+    restrictions : zipline.finance.asset_restrictions.Restrictions
+        Object that combines and returns restricted list information from
+        multiple sources
     universe_func : callable, optional
         Function which returns the current 'universe'.  This is for
         backwards compatibility with older API concepts.
@@ -160,17 +164,19 @@ cdef class BarData:
     cdef object data_portal
     cdef object simulation_dt_func
     cdef object data_frequency
+    cdef object restrictions
     cdef dict _views
     cdef object _universe_func
     cdef object _last_calculated_universe
     cdef object _universe_last_updated_at
     cdef bool _daily_mode
     cdef object _trading_calendar
+    cdef object _is_restricted
 
     cdef bool _adjust_minutes
 
     def __init__(self, data_portal, simulation_dt_func, data_frequency,
-                 trading_calendar, universe_func=None):
+                 trading_calendar, restrictions, universe_func=None):
         self.data_portal = data_portal
         self.simulation_dt_func = simulation_dt_func
         self.data_frequency = data_frequency
@@ -185,6 +191,7 @@ cdef class BarData:
         self._adjust_minutes = False
 
         self._trading_calendar = trading_calendar
+        self._is_restricted = restrictions.is_restricted
 
     cdef _get_equity_price_view(self, asset):
         """
@@ -247,7 +254,8 @@ cdef class BarData:
 
         return dt
 
-    @check_parameters(('assets', 'fields'), ((Asset, str), str))
+    @check_parameters(('assets', 'fields'),
+                      ((Asset, ContinuousFuture) + string_types, string_types))
     def current(self, assets, fields):
         """
         Returns the current value of the given assets for the given fields
@@ -423,6 +431,13 @@ cdef class BarData:
 
                 return pd.DataFrame(data)
 
+    @check_parameters(('continuous_future',),
+                      (ContinuousFuture,))
+    def current_chain(self, continuous_future):
+        return self.data_portal.get_current_future_chain(
+            continuous_future,
+            self.simulation_dt_func())
+
     @check_parameters(('assets',), (Asset,))
     def can_trade(self, assets):
         """
@@ -480,6 +495,9 @@ cdef class BarData:
     cdef bool _can_trade_for_asset(self, asset, dt, adjusted_dt, data_portal):
         cdef object session_label
         cdef object dt_to_use_for_exchange_check,
+
+        if self._is_restricted(asset, adjusted_dt):
+            return False
 
         session_label = self._trading_calendar.minute_to_session_label(dt)
 
@@ -568,8 +586,11 @@ cdef class BarData:
 
             return not (last_traded_dt is pd.NaT)
 
-    @check_parameters(('assets', 'fields', 'bar_count', 'frequency'),
-                      ((Asset, str), str, int, str))
+    @check_parameters(('assets', 'fields', 'bar_count',
+                       'frequency'),
+                      ((Asset, ContinuousFuture) + string_types, string_types,
+                       int,
+                       string_types))
     def history(self, assets, fields, bar_count, frequency):
         """
         Returns a window of data for the given assets and fields.
@@ -615,7 +636,7 @@ cdef class BarData:
         If the current simulation time is not a valid market time, we use the
         last market close instead.
         """
-        if isinstance(fields, str):
+        if isinstance(fields, string_types):
             single_asset = isinstance(assets, Asset)
 
             if single_asset:

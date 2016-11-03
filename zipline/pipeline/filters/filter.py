@@ -24,6 +24,7 @@ from zipline.pipeline.expression import (
     NumericalExpression,
 )
 from zipline.pipeline.mixins import (
+    AliasedMixin,
     CustomTermMixin,
     DownsampledMixin,
     LatestMixin,
@@ -206,6 +207,10 @@ class Filter(RestrictedDTypeMixin, ComputableTerm):
     @classlazyval
     def _downsampled_type(self):
         return DownsampledMixin.make_downsampled_type(Filter)
+
+    @classlazyval
+    def _aliased_type(self):
+        return AliasedMixin.make_aliased_type(Filter)
 
 
 class NumExprFilter(NumericalExpression, Filter):
@@ -494,3 +499,29 @@ class SingleAsset(Filter):
                 asset=self._asset, start_date=dates[0], end_date=dates[-1],
             )
         return out
+
+
+class StaticAssets(Filter):
+    """
+    A Filter that computes True for a specific set of predetermined assets.
+
+    ``StaticAssets`` is mostly useful for debugging or for interactively
+    computing pipeline terms for a fixed set of assets that are known ahead of
+    time.
+
+    Parameters
+    ----------
+    assets : iterable[Asset]
+        An iterable of assets for which to filter.
+    """
+    inputs = ()
+    window_length = 0
+    params = ('sids',)
+
+    def __new__(cls, assets):
+        sids = frozenset(asset.sid for asset in assets)
+        return super(StaticAssets, cls).__new__(cls, sids=sids)
+
+    def _compute(self, arrays, dates, sids, mask):
+        my_columns = sids.isin(self.params['sids'])
+        return repeat_first_axis(my_columns, len(mask)) & mask

@@ -21,8 +21,9 @@ import pandas as pd
 from pandas import DataFrame
 from six import iteritems
 
+from zipline.data.bar_reader import NoDataOnDate
 from zipline.data.resample import (
-    minute_to_session,
+    minute_frame_to_session_frame,
     DailyHistoryAggregator,
     MinuteResampleSessionBarReader,
     ReindexMinuteBarReader,
@@ -500,7 +501,7 @@ class TestMinuteToSession(WithEquityMinuteBarData,
         for sid in self.ASSET_FINDER_EQUITY_SIDS:
             frame = self.equity_frames[sid]
             expected = EXPECTED_SESSIONS[sid]
-            result = minute_to_session(frame, self.nyse_calendar)
+            result = minute_frame_to_session_frame(frame, self.nyse_calendar)
             assert_almost_equal(expected.values,
                                 result.values,
                                 err_msg='sid={0}'.format(sid))
@@ -517,6 +518,19 @@ class TestResampleSessionBars(WithBcolzFutureMinuteBarReader,
     START_DATE = pd.Timestamp('2016-03-16', tz='UTC')
     END_DATE = pd.Timestamp('2016-03-17', tz='UTC')
     NUM_SESSIONS = 2
+
+    @classmethod
+    def make_futures_info(cls):
+        future_dict = {}
+
+        for future_sid in cls.ASSET_FINDER_FUTURE_SIDS:
+            future_dict[future_sid] = {
+                'multiplier': 1000,
+                'exchange': 'CME',
+                'root_symbol': "ABC"
+            }
+
+        return pd.DataFrame.from_dict(future_dict, orient='index')
 
     @classmethod
     def make_future_minute_bar_data(cls):
@@ -543,7 +557,8 @@ class TestResampleSessionBars(WithBcolzFutureMinuteBarReader,
                 OHLCV, first, last, [sid])
             for i, field in enumerate(OHLCV):
                 assert_almost_equal(
-                    result[i], EXPECTED_SESSIONS[sid][[field]],
+                    EXPECTED_SESSIONS[sid][[field]],
+                    result[i],
                     err_msg="sid={0} field={1}".format(sid, field))
 
     def test_sessions(self):
@@ -574,13 +589,24 @@ class TestResampleSessionBars(WithBcolzFutureMinuteBarReader,
                 dt = pd.Timestamp(dt_str, tz='UTC')
                 for col in OHLCV:
                     result = session_bar_reader.get_value(sid, dt, col)
-                    assert_almost_equal(values[col], result,
+                    assert_almost_equal(result,
+                                        values[col],
                                         err_msg="sid={0} col={1} dt={2}".
                                         format(sid, col, dt))
 
     def test_first_trading_day(self):
         self.assertEqual(self.START_DATE,
                          self.session_bar_reader.first_trading_day)
+
+    def test_get_last_traded_dt(self):
+        future = self.asset_finder.retrieve_asset(
+            self.ASSET_FINDER_FUTURE_SIDS[0]
+        )
+
+        self.assertEqual(
+            self.trading_calendar.previous_session_label(self.END_DATE),
+            self.session_bar_reader.get_last_traded_dt(future, self.END_DATE)
+        )
 
 
 class TestReindexMinuteBars(WithBcolzEquityMinuteBarReader,
@@ -778,12 +804,12 @@ class TestReindexSessionBars(WithBcolzEquityDailyBarReader,
                             err_msg="The open of the fixture data on the "
                             "first session should be 10.")
         tday = pd.Timestamp('2015-11-26', tz='UTC')
-        assert_almost_equal(self.reader.get_value(1, tday, 'close'), nan,
-                            err_msg="Thanksgiving is a NYSE holiday, but "
-                            "futures trading is open. Result should be nan.")
-        assert_almost_equal(self.reader.get_value(1, tday, 'volume'), 0,
-                            err_msg="Thanksgiving is a NYSE holiday, but "
-                            "futures trading is open. Result should be 0.")
+
+        with self.assertRaises(NoDataOnDate):
+            self.reader.get_value(1, tday, 'close')
+
+        with self.assertRaises(NoDataOnDate):
+            self.reader.get_value(1, tday, 'volume')
 
     def test_last_availabe_dt(self):
         self.assertEqual(self.reader.last_available_dt, self.END_DATE)

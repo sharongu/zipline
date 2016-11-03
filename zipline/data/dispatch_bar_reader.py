@@ -17,7 +17,7 @@ from abc import ABCMeta, abstractmethod
 from numpy import (
     full,
     nan,
-    uint32,
+    int64,
     zeros
 )
 from six import iteritems, with_metaclass
@@ -35,11 +35,21 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
     - readers : dict
         A dict mapping Asset type to the corresponding
         [Minute|Session]BarReader
+    - last_available_dt : pd.Timestamp or None, optional
+        If not provided, infers it by using the min of the
+        last_available_dt values of the underlying readers.
     """
-    def __init__(self, trading_calendar, asset_finder, readers):
+    def __init__(
+        self,
+        trading_calendar,
+        asset_finder,
+        readers,
+        last_available_dt=None,
+    ):
         self._trading_calendar = trading_calendar
         self._asset_finder = asset_finder
         self._readers = readers
+        self._last_available_dt = last_available_dt
 
         for t, r in iteritems(self._readers):
             assert trading_calendar == r.trading_calendar, \
@@ -60,10 +70,10 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
         return self._dt_window_size(start_dt, end_dt), num_sids
 
     def _make_raw_array_out(self, field, shape):
-        if field != 'volume':
+        if field != 'volume' and field != 'sid':
             out = full(shape, nan)
         else:
-            out = zeros(shape, dtype=uint32)
+            out = zeros(shape, dtype=int64)
         return out
 
     @property
@@ -72,7 +82,10 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
 
     @lazyval
     def last_available_dt(self):
-        return min(r.last_available_dt for r in self._readers.values())
+        if self._last_available_dt is not None:
+            return self._last_available_dt
+        else:
+            return min(r.last_available_dt for r in self._readers.values())
 
     @lazyval
     def first_trading_day(self):
@@ -81,7 +94,7 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
     def get_value(self, sid, dt, field):
         asset = self._asset_finder.retrieve_asset(sid)
         r = self._readers[type(asset)]
-        return r.get_value(sid, dt, field)
+        return r.get_value(asset, dt, field)
 
     def get_last_traded_dt(self, asset, dt):
         r = self._readers[type(asset)]
@@ -96,7 +109,7 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
 
         for i, asset in enumerate(assets):
             t = type(asset)
-            sid_groups[t].append(asset.sid)
+            sid_groups[t].append(asset)
             out_pos[t].append(i)
 
         batched_arrays = {

@@ -76,13 +76,18 @@ from zipline.finance.execution import (
     StopOrder,
 )
 from zipline.finance.performance import PerformanceTracker
+from zipline.finance.asset_restrictions import Restrictions
 from zipline.finance.slippage import (
     VolumeShareSlippage,
     SlippageModel
 )
 from zipline.finance.cancel_policy import NeverCancel, CancelPolicy
+from zipline.finance.asset_restrictions import (
+    NoRestrictions,
+    StaticRestrictions,
+    SecurityListRestrictions,
+)
 from zipline.assets import Asset, Future
-from zipline.assets.futures import FutureChain
 from zipline.gens.tradesimulation import AlgorithmSimulator
 from zipline.pipeline import Pipeline
 from zipline.pipeline.engine import (
@@ -121,6 +126,7 @@ from zipline.utils.math_utils import (
     round_if_near_integer
 )
 from zipline.utils.preprocess import preprocess
+from zipline.utils.security_list import SecurityList
 
 import zipline.protocol
 from zipline.sources.requests_csv import PandasRequestsCSV
@@ -419,6 +425,8 @@ class TradingAlgorithm(object):
         # A dictionary of the actual capital change deltas, keyed by timestamp
         self.capital_change_deltas = {}
 
+        self.restrictions = NoRestrictions()
+
     def init_engine(self, get_loader):
         """
         Construct and store a PipelineEngine from loader.
@@ -565,6 +573,7 @@ class TradingAlgorithm(object):
             self.data_portal,
             self._create_clock(),
             self._create_benchmark_source(),
+            self.restrictions,
             universe_func=self._calculate_universe
         )
 
@@ -819,8 +828,9 @@ class TradingAlgorithm(object):
             else:
                 self.risk_report = perf
 
-        daily_dts = [np.datetime64(perf['period_close'], utc=True)
-                     for perf in daily_perfs]
+        daily_dts = pd.DatetimeIndex(
+            [p['period_close'] for p in daily_perfs], tz='UTC'
+        )
         daily_stats = pd.DataFrame(daily_perfs, index=daily_dts)
 
         return daily_stats
@@ -1176,6 +1186,33 @@ class TradingAlgorithm(object):
         )
 
     @api_method
+    @preprocess(root_symbol_str=ensure_upper_case)
+    def continuous_future(self, root_symbol_str, offset, roll):
+        """Create a specifier for a continuous contract.
+
+        Parameters
+        ----------
+        root_symbol_str : str
+            The root symbol for the future chain.
+
+        offset : int
+            The distance from the primary contract.
+
+        roll_style : str
+            How rolls are determined.
+
+        Returns
+        -------
+        continuous_future : ContinuousFuture
+            The continuous future specifier.
+        """
+        return self.asset_finder.create_continuous_future(
+            root_symbol_str,
+            offset,
+            roll,
+        )
+
+    @api_method
     def symbols(self, *args):
         """Lookup multuple Equities as a list.
 
@@ -1244,68 +1281,6 @@ class TradingAlgorithm(object):
             Raised when no contract named 'symbol' is found.
         """
         return self.asset_finder.lookup_future_symbol(symbol)
-
-    @api_method
-    @preprocess(root_symbol=ensure_upper_case)
-    def future_chain(self, root_symbol, as_of_date=None, offset=0):
-        """
-        Look up a future chain.
-
-        Parameters
-        ----------
-        root_symbol : str
-            The root symbol of a future chain.
-        as_of_date : datetime.datetime or pandas.Timestamp or str, optional
-            Date at which the chain determination is rooted. If this date is
-            not passed in, the current simulation session (not minute) is used.
-        offset: int
-            Number of sessions to shift `as_of_date`.  Positive values shift
-             forward in time.  Negative values shift backward in time.
-
-        Returns
-        -------
-        chain : FutureChain
-            The future chain matching the specified parameters.
-
-        Raises
-        ------
-        RootSymbolNotFound
-            If a future chain could not be found for the given root symbol.
-        """
-        if as_of_date:
-            try:
-                as_of_date = pd.Timestamp(as_of_date, tz='UTC')
-            except ValueError:
-                raise UnsupportedDatetimeFormat(
-                    input=as_of_date,
-                    method='future_chain'
-                )
-        else:
-            as_of_date = self.trading_calendar.minute_to_session_label(
-                self.get_datetime()
-            )
-
-        if offset != 0:
-            # move as_of_date by offset sessions
-            session_window = self.trading_calendar.sessions_window(
-                as_of_date, offset
-            )
-
-            if offset > 0:
-                as_of_date = session_window[-1]
-            else:
-                as_of_date = session_window[0]
-
-        chain_of_contracts = self.asset_finder.lookup_future_chain(
-            root_symbol,
-            as_of_date
-        )
-
-        return FutureChain(
-            root_symbol=root_symbol,
-            as_of_date=as_of_date,
-            contracts=chain_of_contracts
-        )
 
     def _calculate_order_value_amount(self, asset, value):
         """
@@ -1630,13 +1605,6 @@ class TradingAlgorithm(object):
         if tz is not None:
             dt = dt.astimezone(tz)
         return dt
-
-    def update_dividends(self, dividend_frame):
-        """
-        Set DataFrame used to process dividends.  DataFrame columns should
-        contain at least the entries in zp.DIVIDEND_FIELDS.
-        """
-        self.perf_tracker.update_dividends(dividend_frame)
 
     @api_method
     def set_slippage(self, slippage):
@@ -2152,7 +2120,8 @@ class TradingAlgorithm(object):
     def set_max_position_size(self,
                               asset=None,
                               max_shares=None,
-                              max_notional=None):
+                              max_notional=None,
+                              on_error='fail'):
         """Set a limit on the number of shares and/or dollar value held for the
         given sid. Limits are treated as absolute values and are enforced at
         the time that the algo attempts to place an order for sid. This means
@@ -2176,14 +2145,16 @@ class TradingAlgorithm(object):
         """
         control = MaxPositionSize(asset=asset,
                                   max_shares=max_shares,
-                                  max_notional=max_notional)
+                                  max_notional=max_notional,
+                                  on_error=on_error)
         self.register_trading_control(control)
 
     @api_method
     def set_max_order_size(self,
                            asset=None,
                            max_shares=None,
-                           max_notional=None):
+                           max_notional=None,
+                           on_error='fail'):
         """Set a limit on the number of shares and/or dollar value of any single
         order placed for sid.  Limits are treated as absolute values and are
         enforced at the time that the algo attempts to place an order for sid.
@@ -2203,11 +2174,12 @@ class TradingAlgorithm(object):
         """
         control = MaxOrderSize(asset=asset,
                                max_shares=max_shares,
-                               max_notional=max_notional)
+                               max_notional=max_notional,
+                               on_error=on_error)
         self.register_trading_control(control)
 
     @api_method
-    def set_max_order_count(self, max_count):
+    def set_max_order_count(self, max_count, on_error='fail'):
         """Set a limit on the number of orders that can be placed in a single
         day.
 
@@ -2216,27 +2188,68 @@ class TradingAlgorithm(object):
         max_count : int
             The maximum number of orders that can be placed on any single day.
         """
-        control = MaxOrderCount(max_count)
+        control = MaxOrderCount(on_error, max_count)
         self.register_trading_control(control)
 
     @api_method
-    def set_do_not_order_list(self, restricted_list):
+    def set_do_not_order_list(self, restricted_list, on_error='fail'):
         """Set a restriction on which assets can be ordered.
 
         Parameters
         ----------
-        restricted_list : container[Asset]
+        restricted_list : container[Asset], SecurityList
             The assets that cannot be ordered.
         """
-        control = RestrictedListOrder(restricted_list)
-        self.register_trading_control(control)
+        if isinstance(restricted_list, SecurityList):
+            warnings.warn(
+                "`set_do_not_order_list(security_lists.leveraged_etf_list)` "
+                "is deprecated. Use `set_asset_restrictions("
+                "security_lists.restrict_leveraged_etfs)` instead.",
+                category=ZiplineDeprecationWarning,
+                stacklevel=2
+            )
+            restrictions = SecurityListRestrictions(restricted_list)
+        else:
+            warnings.warn(
+                "`set_do_not_order_list(container_of_assets)` is deprecated. "
+                "Create a zipline.finance.asset_restrictions."
+                "StaticRestrictions object with a container of assets and use "
+                "`set_asset_restrictions(StaticRestrictions("
+                "container_of_assets))` instead.",
+                category=ZiplineDeprecationWarning,
+                stacklevel=2
+            )
+            restrictions = StaticRestrictions(restricted_list)
+
+        self.set_asset_restrictions(restrictions, on_error)
 
     @api_method
-    def set_long_only(self):
+    @expect_types(
+        restrictions=Restrictions,
+        on_error=str,
+    )
+    def set_asset_restrictions(self, restrictions, on_error='fail'):
+        """Set a restriction on which assets can be ordered.
+
+        Parameters
+        ----------
+        restricted_list : Restrictions
+            An object providing information about restricted assets.
+
+        See Also
+        --------
+        zipline.finance.asset_restrictions.Restrictions
+        """
+        control = RestrictedListOrder(on_error, restrictions)
+        self.register_trading_control(control)
+        self.restrictions |= restrictions
+
+    @api_method
+    def set_long_only(self, on_error='fail'):
         """Set a rule specifying that this algorithm cannot take short
         positions.
         """
-        self.register_trading_control(LongOnly())
+        self.register_trading_control(LongOnly(on_error))
 
     ##############
     # Pipeline API

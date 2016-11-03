@@ -17,12 +17,23 @@ from operator import mul
 from logbook import Logger
 
 import numpy as np
+from numpy import float64, int64, nan
 import pandas as pd
+from pandas import isnull
 from pandas.tslib import normalize_date
 from six import iteritems
 from six.moves import reduce
 
 from zipline.assets import Asset, Future, Equity
+from zipline.assets.continuous_futures import ContinuousFuture
+from zipline.data.continuous_future_reader import (
+    ContinuousFutureSessionBarReader,
+    ContinuousFutureMinuteBarReader
+)
+from zipline.assets.roll_finder import (
+    CalendarRollFinder,
+    VolumeRollFinder
+)
 from zipline.data.dispatch_bar_reader import (
     AssetDispatchMinuteBarReader,
     AssetDispatchSessionBarReader
@@ -44,6 +55,7 @@ from zipline.utils.math_utils import (
     nanstd
 )
 from zipline.utils.memoize import remember_last, weak_lru_cache
+from zipline.utils.pandas_utils import timedelta_to_integral_minutes
 from zipline.errors import (
     NoTradeDataAvailableTooEarly,
     NoTradeDataAvailableTooLate,
@@ -53,7 +65,15 @@ from zipline.errors import (
 log = Logger('DataPortal')
 
 BASE_FIELDS = frozenset([
-    "open", "high", "low", "close", "volume", "price", "last_traded"
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "price",
+    "contract",
+    "sid",
+    "last_traded",
 ])
 
 OHLCV_FIELDS = frozenset([
@@ -103,6 +123,10 @@ class DataPortal(object):
     adjustment_reader : SQLiteAdjustmentWriter, optional
         The adjustment reader. This is used to apply splits, dividends, and
         other adjustment data to the raw data from the readers.
+    last_available_session : pd.Timestamp, optional
+        The last session to make available in session-level data.
+    last_available_minute : pd.Timestamp, optional
+        The last minute to make available in minute-level data.
     """
     def __init__(self,
                  asset_finder,
@@ -112,7 +136,9 @@ class DataPortal(object):
                  equity_minute_reader=None,
                  future_daily_reader=None,
                  future_minute_reader=None,
-                 adjustment_reader=None):
+                 adjustment_reader=None,
+                 last_available_session=None,
+                 last_available_minute=None):
 
         self.trading_calendar = trading_calendar
         self.asset_finder = asset_finder
@@ -151,6 +177,11 @@ class DataPortal(object):
         aligned_future_session_reader = self._ensure_reader_aligned(
             future_daily_reader)
 
+        self._roll_finders = {
+            'calendar': CalendarRollFinder(self.trading_calendar,
+                                           self.asset_finder),
+        }
+
         aligned_minute_readers = {}
         aligned_session_readers = {}
 
@@ -161,19 +192,37 @@ class DataPortal(object):
 
         if aligned_future_minute_reader is not None:
             aligned_minute_readers[Future] = aligned_future_minute_reader
+            aligned_minute_readers[ContinuousFuture] = \
+                ContinuousFutureMinuteBarReader(
+                    aligned_future_minute_reader,
+                    self._roll_finders,
+                )
+
         if aligned_future_session_reader is not None:
             aligned_session_readers[Future] = aligned_future_session_reader
+            self._roll_finders['volume'] = VolumeRollFinder(
+                self.trading_calendar,
+                self.asset_finder,
+                aligned_future_session_reader,
+            )
+            aligned_session_readers[ContinuousFuture] = \
+                ContinuousFutureSessionBarReader(
+                    aligned_future_session_reader,
+                    self._roll_finders,
+                )
 
         _dispatch_minute_reader = AssetDispatchMinuteBarReader(
             self.trading_calendar,
             self.asset_finder,
             aligned_minute_readers,
+            last_available_minute,
         )
 
         _dispatch_session_reader = AssetDispatchSessionBarReader(
             self.trading_calendar,
             self.asset_finder,
             aligned_session_readers,
+            last_available_session,
         )
 
         self._pricing_readers = {
@@ -189,12 +238,16 @@ class DataPortal(object):
         self._history_loader = DailyHistoryLoader(
             self.trading_calendar,
             _dispatch_session_reader,
-            self._adjustment_reader
+            self._adjustment_reader,
+            self.asset_finder,
+            self._roll_finders,
         )
         self._minute_history_loader = MinuteHistoryLoader(
             self.trading_calendar,
             _dispatch_minute_reader,
-            self._adjustment_reader
+            self._adjustment_reader,
+            self.asset_finder,
+            self._roll_finders,
         )
 
         self._first_trading_day = first_trading_day
@@ -211,12 +264,6 @@ class DataPortal(object):
         self._first_trading_day_loc = (
             self.trading_calendar.all_sessions.get_loc(self._first_trading_day)
             if self._first_trading_day is not None else None
-        )
-        self._first_trading_minute_loc = (
-            self.trading_calendar.all_minutes.get_loc(
-                self._first_trading_minute
-            )
-            if self._first_trading_minute is not None else None
         )
 
     def _ensure_reader_aligned(self, reader):
@@ -347,7 +394,8 @@ class DataPortal(object):
         # at it if it's on something like palladium and not AAPL (since our
         # own price data always wins when dealing with assets).
 
-        return not (field in BASE_FIELDS and isinstance(asset, Asset))
+        return not (field in BASE_FIELDS and
+                    (isinstance(asset, (Asset, ContinuousFuture))))
 
     def _get_fetcher_value(self, asset, field, dt):
         day = normalize_date(dt)
@@ -402,15 +450,19 @@ class DataPortal(object):
                 return 0
             elif field != "last_traded":
                 return np.NaN
+            elif field == "contract":
+                return None
 
         if data_frequency == "daily":
-            return self._get_daily_data(asset, field, session_label)
+            return self._get_daily_spot_value(asset, field, session_label)
         else:
             if field == "last_traded":
                 return self.get_last_traded_dt(asset, dt, 'minute')
             elif field == "price":
                 return self._get_minute_spot_value(asset, "close", dt,
                                                    ffill=True)
+            elif field == "contract":
+                return self._get_current_contract(asset, dt)
             else:
                 return self._get_minute_spot_value(asset, field, dt)
 
@@ -533,9 +585,16 @@ class DataPortal(object):
 
     def _get_minute_spot_value(self, asset, column, dt, ffill=False):
         reader = self._get_pricing_reader('minute')
-        result = reader.get_value(
-            asset.sid, dt, column
-        )
+        try:
+            result = reader.get_value(
+                asset.sid, dt, column
+            )
+        except NoDataOnDate:
+            if not ffill:
+                if column == 'volume':
+                    return 0
+                else:
+                    return np.nan
 
         if not ffill:
             return result
@@ -570,26 +629,19 @@ class DataPortal(object):
             dt, "minute", spot_value=result
         )
 
-    def _get_daily_data(self, asset, column, dt):
+    def _get_daily_spot_value(self, asset, column, dt):
         reader = self._get_pricing_reader('daily')
         if column == "last_traded":
             last_traded_dt = reader.get_last_traded_dt(asset, dt)
 
-            if pd.isnull(last_traded_dt):
+            if isnull(last_traded_dt):
                 return pd.NaT
             else:
                 return last_traded_dt
         elif column in OHLCV_FIELDS:
             # don't forward fill
             try:
-                val = reader.get_value(asset, dt, column)
-                if val == -1:
-                    if column == "volume":
-                        return 0
-                    else:
-                        return np.nan
-                else:
-                    return val
+                return reader.get_value(asset, dt, column)
             except NoDataOnDate:
                 return np.nan
         elif column == "price":
@@ -599,7 +651,7 @@ class DataPortal(object):
                     value = reader.get_value(
                         asset, found_dt, "close"
                     )
-                    if value != -1:
+                    if not isnull(value):
                         if dt == found_dt:
                             return value
                         else:
@@ -651,16 +703,19 @@ class DataPortal(object):
             columns=assets
         )
 
-    def _get_history_daily_window_data(
-            self, assets, days_for_window, end_dt, field_to_use):
-        ends_at_midnight = end_dt.hour == 0 and end_dt.minute == 0
+    def _get_history_daily_window_data(self,
+                                       assets,
+                                       days_for_window,
+                                       end_dt,
+                                       field_to_use):
+        ends_at_midnight = (end_dt.hour == end_dt.minute == 0)
 
         if ends_at_midnight:
             # two cases where we use daily data for the whole range:
             # 1) the history window ends at midnight utc.
             # 2) the last desired day of the window is after the
             # last trading day, use daily data for the whole range.
-            return self._get_daily_window_for_sids(
+            return self._get_daily_window_data(
                 assets,
                 field_to_use,
                 days_for_window,
@@ -668,7 +723,7 @@ class DataPortal(object):
             )
         else:
             # minute mode, requesting '1d'
-            daily_data = self._get_daily_window_for_sids(
+            daily_data = self._get_daily_window_data(
                 assets,
                 field_to_use,
                 days_for_window[0:-1]
@@ -689,16 +744,27 @@ class DataPortal(object):
             elif field_to_use == 'volume':
                 minute_value = self._daily_aggregator.volumes(
                     assets, end_dt)
+            elif field_to_use == 'sid':
+                minute_value = [
+                    int(self._get_current_contract(asset, end_dt))
+                    for asset in assets]
 
             # append the partial day.
             daily_data[-1] = minute_value
 
             return daily_data
 
-    def _handle_history_out_of_bounds(self, bar_count):
+    def _handle_minute_history_out_of_bounds(self, bar_count):
+        first_trading_minute_loc = (
+            self.trading_calendar.all_minutes.get_loc(
+                self._first_trading_minute
+            )
+            if self._first_trading_minute is not None else None
+        )
+
         suggested_start_day = (
             self.trading_calendar.all_minutes[
-                self._first_trading_minute_loc + bar_count
+                first_trading_minute_loc + bar_count
             ] + self.trading_calendar.day
         ).date()
 
@@ -720,12 +786,12 @@ class DataPortal(object):
                 end_dt, -bar_count
             )
         except KeyError:
-            self._handle_history_out_of_bounds(bar_count)
+            self._handle_minute_history_out_of_bounds(bar_count)
 
         if minutes_for_window[0] < self._first_trading_minute:
-            self._handle_history_out_of_bounds(bar_count)
+            self._handle_minute_history_out_of_bounds(bar_count)
 
-        asset_minute_data = self._get_minute_window_for_assets(
+        asset_minute_data = self._get_minute_window_data(
             assets,
             field_to_use,
             minutes_for_window,
@@ -765,7 +831,7 @@ class DataPortal(object):
         -------
         A dataframe containing the requested data.
         """
-        if field not in OHLCVP_FIELDS:
+        if field not in OHLCVP_FIELDS and field != 'sid':
             raise ValueError("Invalid field: {0}".format(field))
 
         if frequency == "1d":
@@ -795,37 +861,48 @@ class DataPortal(object):
                 raise Exception(
                     "Only 1d and 1m are supported for forward-filling.")
 
-            dt_to_fill = df.index[0]
+            assets_with_leading_nan = np.where(isnull(df.iloc[0]))[0]
 
-            perspective_dt = df.index[-1]
-            assets_with_leading_nan = np.where(pd.isnull(df.iloc[0]))[0]
-            for missing_loc in assets_with_leading_nan:
-                asset = assets[missing_loc]
-                previous_dt = self.get_last_traded_dt(
-                    asset, dt_to_fill, data_frequency)
-                if pd.isnull(previous_dt):
-                    continue
-                previous_value = self.get_adjusted_value(
+            history_start, history_end = df.index[[0, -1]]
+            initial_values = []
+            for asset in df.columns[assets_with_leading_nan]:
+                last_traded = self.get_last_traded_dt(
                     asset,
-                    field,
-                    previous_dt,
-                    perspective_dt,
+                    history_start,
                     data_frequency,
                 )
-                df.iloc[0, missing_loc] = previous_value
+                if isnull(last_traded):
+                    initial_values.append(nan)
+                else:
+                    initial_values.append(
+                        self.get_adjusted_value(
+                            asset,
+                            field,
+                            dt=last_traded,
+                            perspective_dt=history_end,
+                            data_frequency=data_frequency,
+                        )
+                    )
 
+            # Set leading values for assets that were missing data, then ffill.
+            df.ix[0, assets_with_leading_nan] = np.array(
+                initial_values,
+                dtype=np.float64
+            )
             df.fillna(method='ffill', inplace=True)
 
+            # forward-filling will incorrectly produce values after the end of
+            # an asset's lifetime, so write NaNs back over the asset's
+            # end_date.
+            normed_index = df.index.normalize()
             for asset in df.columns:
-                if df.index[-1] >= asset.end_date:
+                if history_end >= asset.end_date:
                     # if the window extends past the asset's end date, set
                     # all post-end-date values to NaN in that asset's series
-                    series = df[asset]
-                    series[series.index.normalize() > asset.end_date] = np.NaN
-
+                    df.loc[normed_index > asset.end_date, asset] = nan
         return df
 
-    def _get_minute_window_for_assets(self, assets, field, minutes_for_window):
+    def _get_minute_window_data(self, assets, field, minutes_for_window):
         """
         Internal method that gets a window of adjusted minute data for an asset
         and specified date range.  Used to support the history API method for
@@ -835,8 +912,8 @@ class DataPortal(object):
 
         Parameters
         ----------
-        asset : Asset
-            The asset whose data is desired.
+        assets : iterable[Asset]
+            The assets whose data is desired.
 
         field: string
             The specific field to return.  "open", "high", "close_price", etc.
@@ -849,17 +926,16 @@ class DataPortal(object):
         -------
         A numpy array with requested values.
         """
-        return self._get_minute_window_data(assets, field, minutes_for_window)
-
-    def _get_minute_window_data(
-            self, assets, field, minutes_for_window):
         return self._minute_history_loader.history(assets,
                                                    minutes_for_window,
                                                    field,
                                                    False)
 
-    def _get_daily_window_for_sids(
-            self, assets, field, days_in_window, extra_slot=True):
+    def _get_daily_window_data(self,
+                               assets,
+                               field,
+                               days_in_window,
+                               extra_slot=True):
         """
         Internal method that gets a window of adjusted daily data for a sid
         and specified date range.  Used to support the history API method for
@@ -893,10 +969,11 @@ class DataPortal(object):
         """
         bar_count = len(days_in_window)
         # create an np.array of size bar_count
+        dtype = float64 if field != 'sid' else int64
         if extra_slot:
-            return_array = np.zeros((bar_count + 1, len(assets)))
+            return_array = np.zeros((bar_count + 1, len(assets)), dtype=dtype)
         else:
-            return_array = np.zeros((bar_count, len(assets)))
+            return_array = np.zeros((bar_count, len(assets)), dtype=dtype)
 
         if field != "volume":
             # volumes default to 0, so we don't need to put NaNs in the array
@@ -1099,43 +1176,63 @@ class DataPortal(object):
         else:
             return [assets] if isinstance(assets, Asset) else []
 
+    # cache size picked somewhat loosely.  this code exists purely to
+    # handle deprecated API.
     @weak_lru_cache(20)
     def _get_minute_count_for_transform(self, ending_minute, days_count):
-        # cache size picked somewhat loosely.  this code exists purely to
-        # handle deprecated API.
+        # This function works in three steps.
+        # Step 1. Count the minutes from ``ending_minute`` to the start of its
+        #         session.
+        # Step 2. Count the minutes from the prior ``days_count - 1`` sessions.
+        # Step 3. Return the sum of the results from steps (1) and (2).
 
-        # bars is the number of days desired.  we have to translate that
-        # into the number of minutes we want.
-        # we get all the minutes for the last (bars - 1) days, then add
-        # all the minutes so far today.  the +2 is to account for ignoring
-        # today, and the previous day, in doing the math.
-        session_for_minute = self.trading_calendar.minute_to_session_label(
-            ending_minute
-        )
-        previous_session = self.trading_calendar.previous_session_label(
-            session_for_minute
-        )
+        # Example (NYSE Calendar)
+        #     ending_minute = 2016-12-28 9:40 AM US/Eastern
+        #     days_count = 3
+        # Step 1. Calculate that there are 10 minutes in the ending session.
+        # Step 2. Calculate that there are 390 + 210 = 600 minutes in the prior
+        #         two sessions. (Prior sessions are 2015-12-23 and 2015-12-24.)
+        #         2015-12-24 is a half day.
+        # Step 3. Return 600 + 10 = 610.
 
-        sessions = self.trading_calendar.sessions_in_range(
-            self.trading_calendar.sessions_window(previous_session,
-                                                  -days_count + 2)[0],
-            previous_session,
-        )
+        cal = self.trading_calendar
 
-        minutes_count = sum(
-            len(self.trading_calendar.minutes_for_session(session))
-            for session in sessions
+        ending_session = cal.minute_to_session_label(
+            ending_minute,
+            direction="none",  # It's an error to pass a non-trading minute.
         )
 
-        # add the minutes for today
-        today_open = self.trading_calendar.open_and_close_for_session(
-            session_for_minute
-        )[0]
+        # Assume that calendar days are always full of contiguous minutes,
+        # which means we can just take 1 + (number of minutes between the last
+        # minute and the start of the session). We add one so that we include
+        # the ending minute in the total.
+        ending_session_minute_count = timedelta_to_integral_minutes(
+            ending_minute - cal.open_and_close_for_session(ending_session)[0]
+        ) + 1
 
-        minutes_count += \
-            ((ending_minute - today_open).total_seconds() // 60) + 1
+        if days_count == 1:
+            # We just need sessions for the active day.
+            return ending_session_minute_count
 
-        return minutes_count
+        # XXX: We're subtracting 2 here to account for two offsets:
+        # 1. We only want ``days_count - 1`` sessions, since we've already
+        #    accounted for the ending session above.
+        # 2. The API of ``sessions_window`` is to return one more session than
+        #    the requested number.  I don't think any consumers actually want
+        #    that behavior, but it's the tested and documented behavior right
+        #    now, so we have to request one less session than we actually want.
+        completed_sessions = cal.sessions_window(
+            cal.previous_session_label(ending_session),
+            2 - days_count,
+        )
+
+        completed_sessions_minute_count = (
+            self.trading_calendar.minutes_count_for_sessions_in_range(
+                completed_sessions[0],
+                completed_sessions[-1]
+            )
+        )
+        return ending_session_minute_count + completed_sessions_minute_count
 
     def get_simple_transform(self, asset, transform_name, dt, data_frequency,
                              bars=None):
@@ -1182,3 +1279,31 @@ class DataPortal(object):
                 ret = np.nan
 
             return ret
+
+    def get_current_future_chain(self, continuous_future, dt):
+        """
+        Retrieves the future chain for the contract at the given `dt` according
+        the `continuous_future` specification.
+
+        Returns:
+        future_chain : list[Future]
+            A list of active futures, where the first index is the current
+            contract specified by the continuous future definition, the second
+            is the next upcoming contract and so on.
+        """
+        rf = self._roll_finders[continuous_future.roll_style]
+        session = self.trading_calendar.minute_to_session_label(dt)
+        contract_center = rf.get_contract_center(
+            continuous_future.root_symbol, session,
+            continuous_future.offset)
+        oc = self.asset_finder.get_ordered_contracts(
+            continuous_future.root_symbol)
+        chain = oc.active_chain(contract_center, session.value)
+        return self.asset_finder.retrieve_all(chain)
+
+    def _get_current_contract(self, continuous_future, dt):
+        rf = self._roll_finders[continuous_future.roll_style]
+        return self.asset_finder.retrieve_asset(
+            rf.get_contract_center(continuous_future.root_symbol,
+                                   dt,
+                                   continuous_future.offset))

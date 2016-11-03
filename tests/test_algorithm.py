@@ -25,19 +25,20 @@ import toolz
 from logbook import TestHandler, WARNING
 from mock import MagicMock
 from nose_parameterized import parameterized
-from six import iteritems, itervalues
+from six import iteritems, itervalues, string_types
 from six.moves import range
 from testfixtures import TempDirectory
 
 import numpy as np
 import pandas as pd
 import pytz
-from pandas.io.common import PerformanceWarning
+from pandas.core.common import PerformanceWarning
 
 from zipline import run_algorithm
 from zipline import TradingAlgorithm
 from zipline.api import FixedSlippage
-from zipline.assets import Equity, Future
+from zipline.assets import Equity, Future, Asset
+from zipline.assets.continuous_futures import ContinuousFuture
 from zipline.assets.synthetic import (
     make_jagged_equity_info,
     make_simple_equity_info,
@@ -58,7 +59,6 @@ from zipline.errors import (
     TradingControlViolation,
     AccountControlViolation,
     SymbolNotFound,
-    RootSymbolNotFound,
     UnsupportedDatetimeFormat,
     CannotOrderDelistedAsset,
     SetCancelPolicyPostInit,
@@ -77,6 +77,12 @@ from zipline.finance.commission import PerShare
 from zipline.finance.execution import LimitOrder
 from zipline.finance.order import ORDER_STATUS
 from zipline.finance.trading import SimulationParameters
+from zipline.finance.asset_restrictions import (
+    Restriction,
+    HistoricalRestrictions,
+    StaticRestrictions,
+    RESTRICTION_STATES,
+)
 from zipline.testing import (
     FakeDataPortal,
     create_daily_df_for_asset,
@@ -123,6 +129,8 @@ from zipline.test_algorithms import (
     SetMaxOrderCountAlgorithm,
     SetMaxOrderSizeAlgorithm,
     SetDoNotOrderListAlgorithm,
+    SetAssetRestrictionsAlgorithm,
+    SetMultipleAssetRestrictionsAlgorithm,
     SetMaxLeverageAlgorithm,
     api_algo,
     api_get_environment_algo,
@@ -725,108 +733,6 @@ def log_nyse_close(context, data):
 
         with self.assertRaises(TypeError):
             algo.future_symbol({'foo': 'bar'})
-
-    def test_future_chain_offset(self):
-        # November 2006         December 2006
-        # Su Mo Tu We Th Fr Sa  Su Mo Tu We Th Fr Sa
-        #           1  2  3  4                  1  2
-        #  5  6  7  8  9 10 11   3  4  5  6  7  8  9
-        # 12 13 14 15 16 17 18  10 11 12 13 14 15 16
-        # 19 20 21 22 23 24 25  17 18 19 20 21 22 23
-        # 26 27 28 29 30        24 25 26 27 28 29 30
-        #                       31
-
-        algo = TradingAlgorithm(env=self.env)
-        algo.datetime = pd.Timestamp('2006-12-01', tz='UTC')
-
-        self.assertEqual(
-            algo.future_chain('CL', offset=1).as_of_date,
-            pd.Timestamp("2006-12-04", tz='UTC')
-        )
-
-        self.assertEqual(
-            algo.future_chain("CL", offset=5).as_of_date,
-            pd.Timestamp("2006-12-08", tz='UTC')
-        )
-
-        self.assertEqual(
-            algo.future_chain("CL", offset=-10).as_of_date,
-            pd.Timestamp("2006-11-16", tz='UTC')
-        )
-
-        # September 2016
-        # Su Mo Tu We Th Fr Sa
-        #              1  2  3
-        #  4  5  6  7  8  9 10
-        # 11 12 13 14 15 16 17
-        # 18 19 20 21 22 23 24
-        # 25 26 27 28 29 30
-        self.assertEqual(
-            algo.future_chain(
-                "CL",
-                as_of_date=pd.Timestamp("2016-08-31", tz='UTC'),
-                offset=10
-            ).as_of_date,
-            pd.Timestamp("2016-09-15", tz='UTC')
-        )
-
-    def test_future_chain(self):
-        algo = TradingAlgorithm(env=self.env)
-        algo.datetime = pd.Timestamp('2006-12-01', tz='UTC')
-
-        # Check that the fields of the FutureChain object are set correctly
-        cl = algo.future_chain('CL')
-        self.assertEqual(cl.root_symbol, 'CL')
-        self.assertEqual(cl.as_of_date, algo.datetime)
-
-        # Check the fields are set correctly if an as_of_date is supplied
-        as_of_date = pd.Timestamp('1952-08-11', tz='UTC')
-
-        cl = algo.future_chain('CL', as_of_date=as_of_date)
-        self.assertEqual(cl.root_symbol, 'CL')
-        self.assertEqual(cl.as_of_date, as_of_date)
-
-        cl = algo.future_chain('CL', as_of_date='1952-08-11')
-        self.assertEqual(cl.root_symbol, 'CL')
-        self.assertEqual(cl.as_of_date, as_of_date)
-
-        # Check that weird capitalization is corrected
-        cl = algo.future_chain('cL')
-        self.assertEqual(cl.root_symbol, 'CL')
-
-        cl = algo.future_chain('cl')
-        self.assertEqual(cl.root_symbol, 'CL')
-
-        # Check that invalid root symbols raise RootSymbolNotFound
-        with self.assertRaises(RootSymbolNotFound):
-            algo.future_chain('CLZ')
-
-        with self.assertRaises(RootSymbolNotFound):
-            algo.future_chain('')
-
-        # Check that invalid dates raise UnsupportedDatetimeFormat
-        with self.assertRaises(UnsupportedDatetimeFormat):
-            algo.future_chain('CL', 'my_finger_slipped')
-
-        with self.assertRaises(UnsupportedDatetimeFormat):
-            algo.future_chain('CL', '2015-09-')
-
-        # Supplying a non-string argument to future_chain()
-        # should result in a TypeError.
-        with self.assertRaises(TypeError):
-            algo.future_chain(1)
-
-        with self.assertRaises(TypeError):
-            algo.future_chain((1,))
-
-        with self.assertRaises(TypeError):
-            algo.future_chain({1})
-
-        with self.assertRaises(TypeError):
-            algo.future_chain([1])
-
-        with self.assertRaises(TypeError):
-            algo.future_chain({'foo': 'bar'})
 
     def test_set_symbol_lookup_date(self):
         """
@@ -1448,9 +1354,10 @@ class TestBeforeTradingStart(WithDataPortal,
                     assert (context.hd_portfolio.__dict__[k]
                             == bts_portfolio.__dict__[k])
             record(pos_value=bts_portfolio.positions_value)
-            record(pos_amount=bts_portfolio.positions[sid(3)]['amount'])
-            record(last_sale_price=bts_portfolio.positions[sid(3)]
-                   ['last_sale_price'])
+            record(pos_amount=bts_portfolio.positions[sid(3)].amount)
+            record(
+                last_sale_price=bts_portfolio.positions[sid(3)].last_sale_price
+            )
         def handle_data(context, data):
             if not context.ordered:
                 order(sid(3), 1)
@@ -1522,29 +1429,54 @@ class TestAlgoScript(WithLogger,
     DATA_PORTAL_USE_MINUTE_DATA = False
     EQUITY_DAILY_BAR_LOOKBACK_DAYS = 5  # max history window length
 
+    STRING_TYPE_NAMES = [s.__name__ for s in string_types]
+    STRING_TYPE_NAMES_STRING = ', '.join(STRING_TYPE_NAMES)
+    ASSET_TYPE_NAME = Asset.__name__
+    CONTINUOUS_FUTURE_NAME = ContinuousFuture.__name__
+    ASSET_OR_STRING_TYPE_NAMES = ', '.join([ASSET_TYPE_NAME] +
+                                           STRING_TYPE_NAMES)
+    ASSET_OR_STRING_OR_CF_TYPE_NAMES = ', '.join([ASSET_TYPE_NAME,
+                                                  CONTINUOUS_FUTURE_NAME] +
+                                                 STRING_TYPE_NAMES)
     ARG_TYPE_TEST_CASES = (
-        ('history__assets', (bad_type_history_assets, 'Asset, str', True)),
-        ('history__fields', (bad_type_history_fields, 'str', True)),
+        ('history__assets', (bad_type_history_assets,
+                             ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+                             True)),
+        ('history__fields', (bad_type_history_fields,
+                             STRING_TYPE_NAMES_STRING,
+                             True)),
         ('history__bar_count', (bad_type_history_bar_count, 'int', False)),
-        ('history__frequency', (bad_type_history_frequency, 'str', False)),
-        ('current__assets', (bad_type_current_assets, 'Asset, str', True)),
-        ('current__fields', (bad_type_current_fields, 'str', True)),
+        ('history__frequency', (bad_type_history_frequency,
+                                STRING_TYPE_NAMES_STRING,
+                                False)),
+        ('current__assets', (bad_type_current_assets,
+                             ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+                             True)),
+        ('current__fields', (bad_type_current_fields,
+                             STRING_TYPE_NAMES_STRING,
+                             True)),
         ('is_stale__assets', (bad_type_is_stale_assets, 'Asset', True)),
         ('can_trade__assets', (bad_type_can_trade_assets, 'Asset', True)),
         ('history_kwarg__assets',
-         (bad_type_history_assets_kwarg, 'Asset, str', True)),
+         (bad_type_history_assets_kwarg,
+          ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+          True)),
         ('history_kwarg_bad_list__assets',
-         (bad_type_history_assets_kwarg_list, 'Asset, str', True)),
+         (bad_type_history_assets_kwarg_list,
+          ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+          True)),
         ('history_kwarg__fields',
-         (bad_type_history_fields_kwarg, 'str', True)),
+         (bad_type_history_fields_kwarg, STRING_TYPE_NAMES_STRING, True)),
         ('history_kwarg__bar_count',
          (bad_type_history_bar_count_kwarg, 'int', False)),
         ('history_kwarg__frequency',
-         (bad_type_history_frequency_kwarg, 'str', False)),
+         (bad_type_history_frequency_kwarg, STRING_TYPE_NAMES_STRING, False)),
         ('current_kwarg__assets',
-         (bad_type_current_assets_kwarg, 'Asset, str', True)),
+         (bad_type_current_assets_kwarg,
+          ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+          True)),
         ('current_kwarg__fields',
-         (bad_type_current_fields_kwarg, 'str', True)),
+         (bad_type_current_fields_kwarg, STRING_TYPE_NAMES_STRING, True)),
     )
 
     sids = 0, 1, 3, 133
@@ -2873,34 +2805,114 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
                                            env=self.env)
         self.check_algo_fails(algo, handle_data, 0)
 
-    def test_set_do_not_order_list(self):
-        # set the restricted list to be the sid, and fail.
-        algo = SetDoNotOrderListAlgorithm(
-            sid=self.sid,
-            restricted_list=[self.sid],
-            sim_params=self.sim_params,
-            env=self.env,
-        )
+    def test_set_asset_restrictions(self):
 
         def handle_data(algo, data):
+            algo.could_trade = data.can_trade(algo.sid(self.sid))
             algo.order(algo.sid(self.sid), 100)
             algo.order_count += 1
 
+        # Set HistoricalRestrictions for one sid for the entire simulation,
+        # and fail.
+        rlm = HistoricalRestrictions([
+            Restriction(
+                self.sid,
+                self.sim_params.start_session,
+                RESTRICTION_STATES.FROZEN)
+        ])
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
         self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade)
+
+        # Set StaticRestrictions for one sid and fail.
+        rlm = StaticRestrictions([self.sid])
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
+        self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade)
+
+        # just log an error on the violation if we choose not to fail.
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+            on_error='log'
+        )
+        with make_test_handler(self) as log_catcher:
+            self.check_algo_succeeds(algo, handle_data)
+        logs = [r.message for r in log_catcher.records]
+        self.assertIn("Order for 100 shares of Equity(133 [A]) at "
+                      "2006-01-03 21:00:00+00:00 violates trading constraint "
+                      "RestrictedListOrder({})", logs)
+        self.assertFalse(algo.could_trade)
 
         # set the restricted list to exclude the sid, and succeed
+        rlm = HistoricalRestrictions([
+            Restriction(
+                sid,
+                self.sim_params.start_session,
+                RESTRICTION_STATES.FROZEN) for sid in [134, 135, 136]
+        ])
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
+        self.check_algo_succeeds(algo, handle_data)
+        self.assertTrue(algo.could_trade)
+
+    @parameterized.expand([
+        ('order_first_restricted_sid', 0),
+        ('order_second_restricted_sid', 1)
+    ])
+    def test_set_multiple_asset_restrictions(self, name, to_order_idx):
+
+        def handle_data(algo, data):
+            algo.could_trade1 = data.can_trade(algo.sid(self.sids[0]))
+            algo.could_trade2 = data.can_trade(algo.sid(self.sids[1]))
+            algo.order(algo.sid(self.sids[to_order_idx]), 100)
+            algo.order_count += 1
+
+        rl1 = StaticRestrictions([self.sids[0]])
+        rl2 = StaticRestrictions([self.sids[1]])
+        algo = SetMultipleAssetRestrictionsAlgorithm(
+            restrictions1=rl1,
+            restrictions2=rl2,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
+        self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade1)
+        self.assertFalse(algo.could_trade2)
+
+    def test_set_do_not_order_list(self):
+
+        def handle_data(algo, data):
+            algo.could_trade = data.can_trade(algo.sid(self.sid))
+            algo.order(algo.sid(self.sid), 100)
+            algo.order_count += 1
+
+        rlm = [self.sid]
         algo = SetDoNotOrderListAlgorithm(
             sid=self.sid,
-            restricted_list=[134, 135, 136],
+            restricted_list=rlm,
             sim_params=self.sim_params,
             env=self.env,
         )
 
-        def handle_data(algo, data):
-            algo.order(algo.sid(self.sid), 100)
-            algo.order_count += 1
-
-        self.check_algo_succeeds(algo, handle_data)
+        self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade)
 
     def test_set_max_order_size(self):
 
@@ -3458,7 +3470,7 @@ class TestOrderCancelation(WithDataPortal,
                 'high': minutes_arr + 2,
                 'low': minutes_arr - 1,
                 'close': minutes_arr,
-                'volume': np.full(minutes_count, 1),
+                'volume': np.full(minutes_count, 1.0),
             },
             index=asset_minutes,
         )
@@ -3467,11 +3479,11 @@ class TestOrderCancelation(WithDataPortal,
     def make_equity_daily_bar_data(cls):
         yield 1, pd.DataFrame(
             {
-                'open': np.full(3, 1),
-                'high': np.full(3, 1),
-                'low': np.full(3, 1),
-                'close': np.full(3, 1),
-                'volume': np.full(3, 1),
+                'open': np.full(3, 1, dtype=np.float64),
+                'high': np.full(3, 1, dtype=np.float64),
+                'low': np.full(3, 1, dtype=np.float64),
+                'close': np.full(3, 1, dtype=np.float64),
+                'volume': np.full(3, 1, dtype=np.float64),
             },
             index=cls.sim_params.sessions,
         )

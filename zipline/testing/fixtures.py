@@ -14,7 +14,10 @@ from .core import (
     tmp_dir,
 )
 from ..data.data_portal import DataPortal
-from ..data.resample import minute_to_session
+from ..data.resample import (
+    minute_frame_to_session_frame,
+    MinuteResampleSessionBarReader
+)
 from ..data.us_equity_pricing import (
     SQLiteAdjustmentReader,
     SQLiteAdjustmentWriter,
@@ -36,8 +39,10 @@ from ..utils.classproperty import classproperty
 from ..utils.final import FinalMeta, final
 from .core import tmp_asset_finder, make_simple_equity_info
 from zipline.assets import Equity, Future
+from zipline.finance.asset_restrictions import NoRestrictions
 from zipline.pipeline import SimplePipelineEngine
 from zipline.pipeline.loaders.testing import make_seeded_random_loader
+from zipline.protocol import BarData
 from zipline.utils.calendars import (
     get_calendar,
     register_calendar)
@@ -674,8 +679,9 @@ class WithEquityDailyBarData(WithTradingEnvironment):
         assets = cls.asset_finder.retrieve_all(cls.asset_finder.equities_sids)
         minute_data = dict(cls.make_equity_minute_bar_data())
         for asset in assets:
-            yield asset.sid, minute_to_session(minute_data[asset.sid],
-                                               cls.trading_calendars[Equity])
+            yield asset.sid, minute_frame_to_session_frame(
+                minute_data[asset.sid],
+                cls.trading_calendars[Equity])
 
     @classmethod
     def make_equity_daily_bar_data(cls):
@@ -1263,6 +1269,9 @@ class WithDataPortal(WithAdjustmentReader,
 
     DATA_PORTAL_FIRST_TRADING_DAY = None
 
+    DATA_PORTAL_LAST_AVAILABLE_SESSION = None
+    DATA_PORTAL_LAST_AVAILABLE_MINUTE = None
+
     def make_data_portal(self):
         if self.DATA_PORTAL_FIRST_TRADING_DAY is None:
             if self.DATA_PORTAL_USE_MINUTE_DATA:
@@ -1298,6 +1307,14 @@ class WithDataPortal(WithAdjustmentReader,
                 if self.DATA_PORTAL_USE_MINUTE_DATA else
                 None
             ),
+            future_daily_reader=(
+                MinuteResampleSessionBarReader(
+                    self.bcolz_future_minute_bar_reader.trading_calendar,
+                    self.bcolz_future_minute_bar_reader)
+                if self.DATA_PORTAL_USE_MINUTE_DATA else None
+            ),
+            last_available_session=self.DATA_PORTAL_LAST_AVAILABLE_SESSION,
+            last_available_minute=self.DATA_PORTAL_LAST_AVAILABLE_MINUTE,
         )
 
     def init_instance_fixtures(self):
@@ -1318,4 +1335,18 @@ class WithResponses(object):
         super(WithResponses, self).init_instance_fixtures()
         self.responses = self.enter_instance_context(
             responses.RequestsMock(),
+        )
+
+
+class WithCreateBarData(WithDataPortal):
+
+    CREATE_BARDATA_DATA_FREQUENCY = 'minute'
+
+    def create_bardata(self, simulation_dt_func, restrictions=None):
+        return BarData(
+            self.data_portal,
+            simulation_dt_func,
+            self.CREATE_BARDATA_DATA_FREQUENCY,
+            self.trading_calendar,
+            restrictions or NoRestrictions()
         )
