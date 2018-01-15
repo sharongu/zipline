@@ -25,6 +25,7 @@ from toolz import curry
 
 from zipline.utils.input_validation import preprocess
 from zipline.utils.memoize import lazyval
+from zipline.utils.sentinel import sentinel
 
 from .context_tricks import nop_context
 
@@ -50,6 +51,7 @@ __all__ = [
     # Factory API
     'date_rules',
     'time_rules',
+    'calendars',
     'make_eventrule',
 ]
 
@@ -348,11 +350,19 @@ class AfterOpen(StatelessRule):
         self._one_minute = datetime.timedelta(minutes=1)
 
     def calculate_dates(self, dt):
-        # given a dt, find that day's open and period end (open + offset)
-        self._period_start, self._period_close = \
-            self.cal.open_and_close_for_session(
-                self.cal.minute_to_session_label(dt)
-            )
+        """
+        Given a date, find that day's open and period end (open + offset).
+        """
+        period_start, period_close = self.cal.open_and_close_for_session(
+            self.cal.minute_to_session_label(dt),
+        )
+
+        # Align the market open and close times here with the execution times
+        # used by the simulation clock. This ensures that scheduled functions
+        # trigger at the correct times.
+        self._period_start = self.cal.execution_time_from_open(period_start)
+        self._period_close = self.cal.execution_time_from_close(period_close)
+
         self._period_end = self._period_start + self.offset - self._one_minute
 
     def should_trigger(self, dt):
@@ -396,11 +406,17 @@ class BeforeClose(StatelessRule):
         self._one_minute = datetime.timedelta(minutes=1)
 
     def calculate_dates(self, dt):
-        # given a dt, find that day's close and period start (close - offset)
-        self._period_end = \
-            self.cal.open_and_close_for_session(
-                self.cal.minute_to_session_label(dt)
-            )[1]
+        """
+        Given a dt, find that day's close and period start (close - offset).
+        """
+        period_end = self.cal.open_and_close_for_session(
+            self.cal.minute_to_session_label(dt),
+        )[1]
+
+        # Align the market close time here with the execution time used by the
+        # simulation clock. This ensures that scheduled functions trigger at
+        # the correct times.
+        self._period_end = self.cal.execution_time_from_close(period_end)
 
         self._period_start = self._period_end - self.offset
         self._period_close = self._period_end
@@ -587,6 +603,11 @@ class time_rules(object):
     market_open = AfterOpen
     market_close = BeforeClose
     every_minute = Always
+
+
+class calendars(object):
+    US_EQUITIES = sentinel('US_EQUITIES')
+    US_FUTURES = sentinel('US_FUTURES')
 
 
 def make_eventrule(date_rule, time_rule, cal, half_days=True):

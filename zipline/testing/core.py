@@ -1,6 +1,5 @@
 from abc import ABCMeta, abstractmethod, abstractproperty
 from contextlib import contextmanager
-from functools import wraps
 import gzip
 from inspect import getargspec
 from itertools import (
@@ -28,7 +27,9 @@ from toolz import concat, curry
 
 from zipline.assets import AssetFinder, AssetDBWriter
 from zipline.assets.synthetic import make_simple_equity_info
+from zipline.utils.compat import wraps
 from zipline.data.data_portal import DataPortal
+from zipline.data.loader import get_benchmark_filename, INDEX_MAPPING
 from zipline.data.minute_bars import (
     BcolzMinuteBarReader,
     BcolzMinuteBarWriter,
@@ -39,6 +40,7 @@ from zipline.data.us_equity_pricing import (
     BcolzDailyBarWriter,
     SQLiteAdjustmentWriter,
 )
+from zipline.finance.blotter import Blotter
 from zipline.finance.trading import TradingEnvironment
 from zipline.finance.order import ORDER_STATUS
 from zipline.lib.labelarray import LabelArray
@@ -51,6 +53,7 @@ from zipline.utils.calendars import get_calendar
 from zipline.utils.input_validation import expect_dimensions
 from zipline.utils.numpy_utils import as_column, isnat
 from zipline.utils.pandas_utils import timedelta_to_integral_seconds
+from zipline.utils.paths import ensure_directory
 from zipline.utils.sentinel import sentinel
 
 import numpy as np
@@ -282,8 +285,8 @@ def chrange(start, stop):
     chars: iterable[str]
         Iterable of strings beginning with start and ending with stop.
 
-    Example
-    -------
+    Examples
+    --------
     >>> chrange('A', 'C')
     ['A', 'B', 'C']
     """
@@ -405,7 +408,7 @@ def check_arrays(x, y, err_msg='', verbose=True, check_dtypes=True):
         )
         # Fill NaTs with zero for comparison.
         x = np.where(x_isnat, np.zeros_like(x), x)
-        y = np.where(x_isnat, np.zeros_like(x), x)
+        y = np.where(y_isnat, np.zeros_like(y), y)
 
     return assert_array_equal(x, y, err_msg=err_msg, verbose=verbose)
 
@@ -694,11 +697,8 @@ def create_data_portal_from_trade_history(asset_finder, trading_calendar,
 
 
 class FakeDataPortal(DataPortal):
-    def __init__(self, env=None, trading_calendar=None,
+    def __init__(self, env, trading_calendar=None,
                  first_trading_day=None):
-        if env is None:
-            env = TradingEnvironment()
-
         if trading_calendar is None:
             trading_calendar = get_calendar("NYSE")
 
@@ -713,7 +713,7 @@ class FakeDataPortal(DataPortal):
             return 1.0
 
     def get_history_window(self, assets, end_dt, bar_count, frequency, field,
-                           ffill=True):
+                           data_frequency, ffill=True):
         if frequency == "1d":
             end_idx = \
                 self.trading_calendar.all_sessions.searchsorted(end_dt)
@@ -861,6 +861,8 @@ class tmp_trading_env(tmp_asset_finder):
 
     Parameters
     ----------
+    load : callable, optional
+        Function that returns benchmark returns and treasury curves.
     finder_cls : type, optional
         The type of asset finder to create from the assets db.
     **frames
@@ -871,8 +873,13 @@ class tmp_trading_env(tmp_asset_finder):
     empty_trading_env
     tmp_asset_finder
     """
+    def __init__(self, load=None, *args, **kwargs):
+        super(tmp_trading_env, self).__init__(*args, **kwargs)
+        self._load = load
+
     def __enter__(self):
         return TradingEnvironment(
+            load=self._load,
             asset_db_path=super(tmp_trading_env, self).__enter__().engine,
         )
 
@@ -1083,7 +1090,9 @@ def temp_pipeline_engine(calendar, sids, random_seed, symbols=None):
     )
 
     loader = make_seeded_random_loader(random_seed, calendar, sids)
-    get_loader = lambda column: loader
+
+    def get_loader(column):
+        return loader
 
     with tmp_asset_finder(equities=equity_info) as finder:
         yield SimplePipelineEngine(get_loader, calendar, finder)
@@ -1097,8 +1106,8 @@ def parameter_space(__fail_fast=False, **params):
     The decorated test function will be called with the cross-product of all
     possible inputs
 
-    Usage
-    -----
+    Examples
+    --------
     >>> from unittest import TestCase
     >>> class SomeTestCase(TestCase):
     ...     @parameter_space(x=[1, 2], y=[2, 3])
@@ -1139,16 +1148,21 @@ def parameter_space(__fail_fast=False, **params):
                 "supplied to parameter_space()." % extra
             )
 
-        param_sets = product(*(params[name] for name in argnames))
+        def make_param_sets():
+            return product(*(params[name] for name in argnames))
 
         if __fail_fast:
             @wraps(f)
             def wrapped(self):
-                for args in param_sets:
+                for args in make_param_sets():
                     f(self, *args)
             return wrapped
         else:
-            return subtest(param_sets, *argnames)(f)
+            @wraps(f)
+            def wrapped(*args, **kwargs):
+                subtest(make_param_sets(), *argnames)(f)(*args, **kwargs)
+
+        return wrapped
 
     return decorator
 
@@ -1478,6 +1492,19 @@ def patch_read_csv(url_map, module=pd, strict=False):
         yield
 
 
+def copy_market_data(src_market_data_dir, dest_root_dir):
+    symbol = 'SPY'
+    filenames = (get_benchmark_filename(symbol), INDEX_MAPPING[symbol][1])
+
+    ensure_directory(os.path.join(dest_root_dir, 'data'))
+
+    for filename in filenames:
+        shutil.copyfile(
+            os.path.join(src_market_data_dir, filename),
+            os.path.join(dest_root_dir, 'data', filename)
+        )
+
+
 @curry
 def ensure_doctest(f, name=None):
     """Ensure that an object gets doctested. This is useful for instances
@@ -1500,6 +1527,18 @@ def ensure_doctest(f, name=None):
         f.__name__ if name is None else name
     ] = f
     return f
+
+
+class RecordBatchBlotter(Blotter):
+    """Blotter that tracks how its batch_order method was called.
+    """
+    def __init__(self, data_frequency):
+        super(RecordBatchBlotter, self).__init__(data_frequency)
+        self.order_batch_called = []
+
+    def batch_order(self, *args, **kwargs):
+        self.order_batch_called.append((args, kwargs))
+        return super(RecordBatchBlotter, self).batch_order(*args, **kwargs)
 
 
 ####################################

@@ -16,6 +16,8 @@ from warnings import warn
 
 import pandas as pd
 
+from zipline.assets import Asset, Future
+from zipline.utils.input_validation import expect_types
 from .utils.enum import enum
 from zipline._protocol import BarData  # noqa
 
@@ -134,6 +136,10 @@ class Order(Event):
     )
 
 
+def asset_multiplier(asset):
+    return asset.multiplier if isinstance(asset, Future) else 1
+
+
 class Portfolio(object):
 
     def __init__(self):
@@ -166,6 +172,26 @@ class Portfolio(object):
             'positions_value',
         },
     )
+
+    @property
+    def current_portfolio_weights(self):
+        """
+        Compute each asset's weight in the portfolio by calculating its held
+        value divided by the total value of all positions.
+
+        Each equity's value is its price times the number of shares held. Each
+        futures contract's value is its unit price times number of shares held
+        times the multiplier.
+        """
+        position_values = pd.Series({
+            asset: (
+                position.last_sale_price *
+                position.amount *
+                asset_multiplier(asset)
+            )
+            for asset, position in self.positions.items()
+        })
+        return position_values / self.portfolio_value
 
 
 class Account(object):
@@ -225,13 +251,18 @@ class Account(object):
 
 
 class Position(object):
-
-    def __init__(self, sid):
-        self.sid = sid
+    @expect_types(asset=Asset)
+    def __init__(self, asset):
+        self.asset = asset
         self.amount = 0
         self.cost_basis = 0.0  # per share
         self.last_sale_price = 0.0
         self.last_sale_date = None
+
+    @property
+    def sid(self):
+        # for backwards compatibility
+        return self.asset
 
     def __repr__(self):
         return "Position({0})".format(self.__dict__)
@@ -250,8 +281,43 @@ class Position(object):
     )
 
 
-class Positions(dict):
+# Copied from Position and renamed.  This is used to handle cases where a user
+# does something like `context.portfolio.positions[100]` instead of
+# `context.portfolio.positions[sid(100)]`.
+class _DeprecatedSidLookupPosition(object):
+    def __init__(self, sid):
+        self.sid = sid
+        self.amount = 0
+        self.cost_basis = 0.0  # per share
+        self.last_sale_price = 0.0
+        self.last_sale_date = None
 
+    def __repr__(self):
+        return "_DeprecatedSidLookupPosition({0})".format(self.__dict__)
+
+    # If you are adding new attributes, don't update this set. This method
+    # is deprecated to normal attribute access so we don't want to encourage
+    # new usages.
+    __getitem__ = _deprecated_getitem_method(
+        'position', {
+            'sid',
+            'amount',
+            'cost_basis',
+            'last_sale_price',
+            'last_sale_date',
+        },
+    )
+
+
+class Positions(dict):
     def __missing__(self, key):
-        pos = Position(key)
-        return pos
+        if isinstance(key, Asset):
+            return Position(key)
+        elif isinstance(key, int):
+            warn("Referencing positions by integer is deprecated."
+                 " Use an asset instead.")
+        else:
+            warn("Position lookup expected a value of type Asset but got {0}"
+                 " instead.".format(type(key).__name__))
+
+        return _DeprecatedSidLookupPosition(key)

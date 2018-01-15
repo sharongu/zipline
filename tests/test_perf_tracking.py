@@ -22,6 +22,7 @@ from datetime import (
 )
 import logging
 
+from nose_parameterized import parameterized
 import nose.tools as nt
 import pytz
 
@@ -57,7 +58,6 @@ from zipline.testing.fixtures import (
     WithSimParams,
     WithTmpDir,
     WithTradingEnvironment,
-    WithTradingCalendars,
     ZiplineTestCase,
 )
 from zipline.utils.calendars import get_calendar
@@ -146,7 +146,7 @@ def create_txn(asset, dt, price, amount):
 
 
 def calculate_results(sim_params,
-                      env,
+                      asset_finder,
                       data_portal,
                       splits=None,
                       txns=None,
@@ -178,7 +178,7 @@ def calculate_results(sim_params,
     commissions = commissions or {}
 
     perf_tracker = perf.PerformanceTracker(
-        sim_params, get_calendar("NYSE"), env
+        sim_params, get_calendar("NYSE"), asset_finder,
     )
 
     results = []
@@ -276,25 +276,23 @@ class TestSplitPerformance(WithSimParams, WithTmpDir, ZiplineTestCase):
     def init_class_fixtures(cls):
         super(TestSplitPerformance, cls).init_class_fixtures()
         cls.asset1 = cls.env.asset_finder.retrieve_asset(1)
+        cls.asset2 = cls.env.asset_finder.retrieve_asset(2)
 
     def test_multiple_splits(self):
         # if multiple positions all have splits at the same time, verify that
         # the total leftover cash is correct
         perf_tracker = perf.PerformanceTracker(self.sim_params,
                                                self.trading_calendar,
-                                               self.env)
-
-        asset1 = self.asset_finder.retrieve_asset(1)
-        asset2 = self.asset_finder.retrieve_asset(2)
+                                               self.asset_finder)
 
         perf_tracker.position_tracker.positions[1] = \
-            Position(asset1, amount=10, cost_basis=10, last_sale_price=11)
+            Position(self.asset1, amount=10, cost_basis=10, last_sale_price=11)
 
         perf_tracker.position_tracker.positions[2] = \
-            Position(asset2, amount=10, cost_basis=10, last_sale_price=11)
+            Position(self.asset2, amount=10, cost_basis=10, last_sale_price=11)
 
         leftover_cash = perf_tracker.position_tracker.handle_splits(
-            [(1, 0.333), (2, 0.333)]
+            [(self.asset1, 0.333), (self.asset2, 0.333)]
         )
 
         # we used to have 10 shares that each cost us $10, total $100
@@ -329,11 +327,11 @@ class TestSplitPerformance(WithSimParams, WithTmpDir, ZiplineTestCase):
         # set up a split with ratio 3 occurring at the start of the second
         # day.
         splits = {
-            events[1].dt: [(1, 3)]
+            events[1].dt: [(self.asset1, 3)]
         }
 
         results = calculate_results(self.sim_params,
-                                    self.env,
+                                    self.asset_finder,
                                     data_portal,
                                     txns=txns,
                                     splits=splits)
@@ -347,7 +345,7 @@ class TestSplitPerformance(WithSimParams, WithTmpDir, ZiplineTestCase):
         # check the last position to make sure it's been updated
         position = latest_positions[0]
 
-        self.assertEqual(1, position['sid'])
+        self.assertEqual(self.asset1, position['sid'])
         self.assertEqual(33, position['amount'])
         self.assertEqual(60, position['cost_basis'])
         self.assertEqual(60, position['last_sale_price'])
@@ -469,7 +467,7 @@ class TestDividendPerformance(WithSimParams,
         txns = [create_txn(self.asset1, events[0].dt, 10.0, 100)]
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -546,7 +544,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -612,7 +610,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -675,7 +673,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -739,7 +737,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -804,7 +802,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -866,7 +864,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -924,7 +922,7 @@ class TestDividendPerformance(WithSimParams,
 
         results = calculate_results(
             self.sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
         )
 
@@ -1001,7 +999,7 @@ class TestDividendPerformance(WithSimParams,
         txns = [create_txn(self.asset1, events[0].dt, 10.0, 100)]
         results = calculate_results(
             sim_params,
-            self.env,
+            self.asset_finder,
             data_portal,
             txns=txns,
         )
@@ -1031,7 +1029,8 @@ class TestDividendPerformanceHolidayStyle(TestDividendPerformance):
     END_DATE = pd.Timestamp('2003-12-08', tz='utc')
 
 
-class TestPositionPerformance(WithInstanceTmpDir, WithTradingCalendars,
+class TestPositionPerformance(WithInstanceTmpDir,
+                              WithTradingEnvironment,
                               ZiplineTestCase):
 
     def create_environment_stuff(self,
@@ -1056,6 +1055,7 @@ class TestPositionPerformance(WithInstanceTmpDir, WithTradingCalendars,
         self.env = self.enter_instance_context(tmp_trading_env(
             equities=equities,
             futures=futures,
+            load=self.make_load_function(),
         ))
         self.sim_params = create_simulation_parameters(
             start=start,
@@ -1106,10 +1106,8 @@ class TestPositionPerformance(WithInstanceTmpDir, WithTradingCalendars,
         txn1 = create_txn(self.asset1, trades_1[0].dt, 10.0, 100)
         txn2 = create_txn(self.asset2, trades_1[0].dt, 10.0, -100)
 
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
-                                    self.sim_params.data_frequency)
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0, self.sim_params.data_frequency)
         pp.position_tracker = pt
         pt.execute_transaction(txn1)
         pp.handle_execution(txn1)
@@ -1199,10 +1197,8 @@ class TestPositionPerformance(WithInstanceTmpDir, WithTradingCalendars,
             self.sim_params,
             {1: trades})
         txn = create_txn(self.asset1, trades[1].dt, 10.0, 1000)
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
-                                    self.sim_params.data_frequency)
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0, self.sim_params.data_frequency)
         pp.position_tracker = pt
 
         pt.execute_transaction(txn)
@@ -1291,9 +1287,8 @@ class TestPositionPerformance(WithInstanceTmpDir, WithTradingCalendars,
             self.sim_params,
             {1: trades})
         txn = create_txn(self.asset1, trades[1].dt, 10.0, 100)
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0,
                                     self.sim_params.data_frequency,
                                     period_open=self.sim_params.start_session,
                                     period_close=self.sim_params.end_session)
@@ -1326,8 +1321,8 @@ class TestPositionPerformance(WithInstanceTmpDir, WithTradingCalendars,
             "should be just one position")
 
         self.assertEqual(
-            pp.positions[1].sid,
-            txn.sid,
+            pp.positions[1].asset,
+            txn.asset,
             "position should be in security with id 1")
 
         self.assertEqual(
@@ -1410,11 +1405,8 @@ single short-sale transaction"""
             {1: trades})
 
         txn = create_txn(self.asset1, trades[1].dt, 10.0, -100)
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(
-            1000.0, self.env.asset_finder,
-            self.sim_params.data_frequency)
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0, self.sim_params.data_frequency)
         pp.position_tracker = pt
 
         pt.execute_transaction(txn)
@@ -1437,8 +1429,8 @@ single short-sale transaction"""
             "should be just one position")
 
         self.assertEqual(
-            pp.positions[1].sid,
-            txn.sid,
+            pp.positions[1].asset,
+            txn.asset,
             "position should be in security from the transaction"
         )
 
@@ -1494,8 +1486,8 @@ single short-sale transaction"""
         )
 
         self.assertEqual(
-            pp.positions[1].sid,
-            txn.sid,
+            pp.positions[1].asset,
+            txn.asset,
             "position should be in security from the transaction"
         )
 
@@ -1530,10 +1522,10 @@ single short-sale transaction"""
         )
 
         # now run a performance period encompassing the entire trade sample.
-        ptTotal = perf.PositionTracker(self.env.asset_finder,
-                                       self.sim_params.data_frequency)
-        ppTotal = perf.PerformancePeriod(1000.0, self.env.asset_finder,
-                                         self.sim_params.data_frequency)
+        ptTotal = perf.PositionTracker(self.sim_params.data_frequency)
+        ppTotal = perf.PerformancePeriod(
+            1000.0, self.sim_params.data_frequency
+        )
         ppTotal.position_tracker = pt
 
         ptTotal.execute_transaction(txn)
@@ -1556,8 +1548,8 @@ cost of sole txn in test"
             "should be just one position"
         )
         self.assertEqual(
-            ppTotal.positions[1].sid,
-            txn.sid,
+            ppTotal.positions[1].asset,
+            txn.asset,
             "position should be in security from the transaction"
         )
 
@@ -1638,10 +1630,8 @@ trade after cover"""
 
         short_txn = create_txn(self.asset1, trades[1].dt, 10.0, -100)
         cover_txn = create_txn(self.asset1, trades[6].dt, 7.0, 100)
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
-                                    self.sim_params.data_frequency)
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0, self.sim_params.data_frequency)
         pp.position_tracker = pt
 
         pt.execute_transaction(short_txn)
@@ -1725,11 +1715,9 @@ shares in position"
             self.sim_params,
             {1: trades})
 
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
         pp = perf.PerformancePeriod(
             1000.0,
-            self.env.asset_finder,
             self.sim_params.data_frequency,
             period_open=self.sim_params.start_session,
             period_close=self.sim_params.sessions[-1]
@@ -1792,10 +1780,8 @@ shares in position"
 
         self.assertEqual(pp.pnl, -800, "this period goes from +400 to -400")
 
-        pt3 = perf.PositionTracker(self.env.asset_finder,
-                                   self.sim_params.data_frequency)
-        pp3 = perf.PerformancePeriod(1000.0, self.env.asset_finder,
-                                     self.sim_params.data_frequency)
+        pt3 = perf.PositionTracker(self.sim_params.data_frequency)
+        pp3 = perf.PerformancePeriod(1000.0, self.sim_params.data_frequency)
         pp3.position_tracker = pt3
 
         average_cost = 0
@@ -1834,7 +1820,7 @@ shares in position"
         self.create_environment_stuff(num_days=8)
 
         history_args = (
-            1,
+            self.asset1,
             [10, 9, 11, 8, 9, 12, 13, 14],
             [200, -100, -100, 100, -300, 100, 500, 400],
             oneday,
@@ -1845,10 +1831,8 @@ shares in position"
 
         transactions = factory.create_txn_history(*history_args)
 
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
-                                    self.sim_params.data_frequency)
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0, self.sim_params.data_frequency)
         pp.position_tracker = pt
 
         for idx, (txn, cb) in enumerate(zip(transactions, cost_bases)):
@@ -1885,9 +1869,8 @@ shares in position"
             self.sim_params,
             {1: trades})
         txn = create_txn(self.asset1, trades[0].dt, 10.0, 100)
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0,
                                     self.sim_params.data_frequency,
                                     period_open=self.sim_params.start_session,
                                     period_close=self.sim_params.end_session)
@@ -1929,9 +1912,8 @@ shares in position"
             self.sim_params,
             {1: trades})
         txn = create_txn(self.asset1, trades[0].dt, 10.0, 100)
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  self.sim_params.data_frequency)
-        pp = perf.PerformancePeriod(1000.0, self.env.asset_finder,
+        pt = perf.PositionTracker(self.sim_params.data_frequency)
+        pp = perf.PerformancePeriod(1000.0,
                                     self.sim_params.data_frequency,
                                     period_open=self.sim_params.start_session,
                                     period_close=self.sim_params.end_session)
@@ -1974,6 +1956,16 @@ class TestPositionTracker(WithTradingEnvironment,
     ASSET_FINDER_EQUITY_SIDS = 1, 2
 
     @classmethod
+    def init_class_fixtures(cls):
+        super(TestPositionTracker, cls).init_class_fixtures()
+
+        cls.EQUITY1 = cls.asset_finder.retrieve_asset(1)
+        cls.EQUITY2 = cls.asset_finder.retrieve_asset(2)
+        cls.FUTURE3 = cls.asset_finder.retrieve_asset(3)
+        cls.FUTURE4 = cls.asset_finder.retrieve_asset(4)
+        cls.FUTURE5 = cls.asset_finder.retrieve_asset(1032201401)
+
+    @classmethod
     def make_futures_info(cls):
         return pd.DataFrame.from_dict(
             {
@@ -1993,8 +1985,7 @@ class TestPositionTracker(WithTradingEnvironment,
         """
         sim_params = factory.create_simulation_parameters(num_days=4)
 
-        pt = perf.PositionTracker(self.env.asset_finder,
-                                  sim_params.data_frequency)
+        pt = perf.PositionTracker(sim_params.data_frequency)
         pos_stats = pt.stats()
 
         stats = [
@@ -2015,17 +2006,27 @@ class TestPositionTracker(WithTradingEnvironment,
             self.assertNotIsInstance(val, (bool, np.bool_))
 
     def test_position_values_and_exposures(self):
-        pt = perf.PositionTracker(self.env.asset_finder, None)
+        pt = perf.PositionTracker(None)
         dt = pd.Timestamp("1984/03/06 3:00PM")
-        pos1 = perf.Position(1, amount=np.float64(10.0),
-                             last_sale_date=dt, last_sale_price=10)
-        pos2 = perf.Position(2, amount=np.float64(-20.0),
-                             last_sale_date=dt, last_sale_price=10)
-        pos3 = perf.Position(3, amount=np.float64(30.0),
-                             last_sale_date=dt, last_sale_price=10)
-        pos4 = perf.Position(4, amount=np.float64(-40.0),
-                             last_sale_date=dt, last_sale_price=10)
-        pt.update_positions({1: pos1, 2: pos2, 3: pos3, 4: pos4})
+        pt.update_position(
+            self.EQUITY1, amount=np.float64(10.0),
+            last_sale_date=dt, last_sale_price=10
+        )
+
+        pt.update_position(
+            self.EQUITY2, amount=np.float64(-20.0),
+            last_sale_date=dt, last_sale_price=10
+        )
+
+        pt.update_position(
+            self.FUTURE3, amount=np.float64(30.0),
+            last_sale_date=dt, last_sale_price=10
+        )
+
+        pt.update_position(
+            self.FUTURE4, amount=np.float64(-40.0),
+            last_sale_date=dt, last_sale_price=10
+        )
 
         # Test long-only methods
         pos_stats = pt.stats()
@@ -2046,25 +2047,67 @@ class TestPositionTracker(WithTradingEnvironment,
         self.assertEqual(100 + 200 + 300000 + 400000, pos_stats.gross_exposure)
         self.assertEqual(100 - 200 + 300000 - 400000, pos_stats.net_exposure)
 
-    def test_update_positions(self):
-        pt = perf.PositionTracker(self.env.asset_finder, None)
-        dt = pd.Timestamp("2014/01/01 3:00PM")
-        pos1 = perf.Position(1, amount=np.float64(10.0),
-                             last_sale_date=dt, last_sale_price=10)
-        pos2 = perf.Position(2, amount=np.float64(-20.0),
-                             last_sale_date=dt, last_sale_price=10)
-        pos3 = perf.Position(1032201401, amount=np.float64(30.0),
-                             last_sale_date=dt, last_sale_price=100)
+    @parameterized.expand([('FutureLong', True, 1),
+                           ('FutureShort', True, -1),
+                           ('EquityLong', False, 1),
+                           ('EquityShort', False, -1)])
+    def test_cost_basis(self, _, is_future, sign):
 
-        # Call update_positions twice. When the second call is made,
-        # self.positions will already contain data. The order of this data
-        # needs to be preserved so that it is consistent with the order of the
-        # data stored in the multipliers OrderedDict()'s. If self.positions
-        # were to be stored as a dict, then its order could change in arbitrary
-        # ways when the second update_positions call is made. Hence we also
-        # store it as an OrderedDict.
-        pt.update_positions({1: pos1, 1032201401: pos3})
-        pt.update_positions({2: pos2})
+        asset = self.FUTURE3 if is_future else self.EQUITY1
+        dt = pd.Timestamp("2015-12-10 15:00", tz='UTC')
+
+        position = perf.Position(
+            asset,
+            amount=sign*10,
+            last_sale_date=dt,
+            cost_basis=10,
+            last_sale_price=11,
+        )
+
+        self.assertEqual(10, position.cost_basis)
+
+        # If position is an equity position:
+        # send a $5 commission to the equity position.  Spread out over 10
+        # shares, that bumps the cost basis by $0.50.
+        #
+        # If position is a futures position:
+        # send a $5k commission to the futures position.  since self.FUTURE3
+        # has a contract size (multipler) of 1000, this should result in a
+        # $10.5 updated cost basis. (5000 / 1000 = $5, spread out over 10
+        # contracts, is $0.50 extra per contract).
+        position.adjust_commission_cost_basis(asset, 5000 if is_future else 5)
+        self.assertEqual(10.0 + sign * 0.5, position.cost_basis)
+
+    def test_update_positions(self):
+        pt = perf.PositionTracker(None)
+        dt = pd.Timestamp("2014/01/01 3:00PM")
+        # pos1 = perf.Position(self.EQUITY1, amount=np.float64(10.0),
+        #                      last_sale_date=dt, last_sale_price=10)
+        # pos2 = perf.Position(self.EQUITY2, amount=np.float64(-20.0),
+        #                      last_sale_date=dt, last_sale_price=10)
+        # pos3 = perf.Position(self.FUTURE5, amount=np.float64(30.0),
+        #                      last_sale_date=dt, last_sale_price=100)
+
+        pt.update_position(
+            self.EQUITY1,
+            amount=np.float64(10.0),
+            last_sale_price=10,
+            last_sale_date=dt
+        )
+
+        pt.update_position(
+            self.EQUITY2,
+            amount=np.float64(-20.0),
+            last_sale_price=10,
+            last_sale_date=dt
+        )
+
+        pt.update_position(
+            self.FUTURE5,
+            amount=np.float64(30.0),
+            last_sale_price=100,
+            last_sale_date=dt
+        )
 
         pos_stats = pt.stats()
         # Test long-only methods
@@ -2085,3 +2128,40 @@ class TestPositionTracker(WithTradingEnvironment,
         # Test gross and net exposures
         self.assertEqual(100 + 150000 + 200, pos_stats.gross_exposure)
         self.assertEqual(100 + 150000 - 200, pos_stats.net_exposure)
+
+    def test_close_position(self):
+        pt = perf.PositionTracker(None)
+        dt = pd.Timestamp('2017/01/04 3:00PM')
+
+        pt.update_position(
+            asset=self.FUTURE5, amount=np.float64(30.0),
+            last_sale_date=dt, last_sale_price=100
+        )
+
+        pt.update_position(
+            asset=self.EQUITY1, amount=np.float64(10.0),
+            last_sale_date=dt, last_sale_price=10
+        )
+
+        txn = create_txn(self.FUTURE5, dt, 100, -30)
+        pt.execute_transaction(txn)
+
+        pos_stats = pt.stats()
+
+        # Test long-only methods.
+        self.assertEqual(100, pos_stats.long_value)
+        self.assertEqual(100, pos_stats.long_exposure)
+        self.assertEqual(1, pos_stats.longs_count)
+
+        # Test short-only methods.
+        self.assertEqual(0, pos_stats.short_value)
+        self.assertEqual(0, pos_stats.short_exposure)
+        self.assertEqual(0, pos_stats.shorts_count)
+
+        # Test gross and net values.
+        self.assertEqual(100, pos_stats.gross_value)
+        self.assertEqual(100, pos_stats.net_value)
+
+        # Test gross and net exposures.
+        self.assertEqual(100, pos_stats.gross_exposure)
+        self.assertEqual(100, pos_stats.net_exposure)

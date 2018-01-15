@@ -26,14 +26,19 @@ from toolz import sliding_window
 
 from six import with_metaclass
 
-from zipline.assets import Equity
+from zipline.assets import Equity, Future
 from zipline.assets.continuous_futures import ContinuousFuture
 from zipline.lib._int64window import AdjustedArrayWindow as Int64Window
 from zipline.lib._float64window import AdjustedArrayWindow as Float64Window
 from zipline.lib.adjustment import Float64Multiply, Float64Add
 from zipline.utils.cache import ExpiringCache
+from zipline.utils.math_utils import number_of_decimal_places
 from zipline.utils.memoize import lazyval
 from zipline.utils.numpy_utils import float64_dtype
+from zipline.utils.pandas_utils import find_in_sorted_index
+
+# Default number of decimal places used for rounding asset prices.
+DEFAULT_ASSET_PRICE_DECIMALS = 3
 
 
 class HistoryCompatibleUSEquityAdjustmentReader(object):
@@ -307,7 +312,8 @@ class HistoryLoader(with_metaclass(ABCMeta)):
     def __init__(self, trading_calendar, reader, equity_adjustment_reader,
                  asset_finder,
                  roll_finders=None,
-                 sid_cache_size=1000):
+                 sid_cache_size=1000,
+                 prefetch_length=0):
         self.trading_calendar = trading_calendar
         self._asset_finder = asset_finder
         self._reader = reader
@@ -327,13 +333,10 @@ class HistoryLoader(with_metaclass(ABCMeta)):
             field: ExpiringCache(LRU(sid_cache_size))
             for field in self.FIELDS
         }
+        self._prefetch_length = prefetch_length
 
     @abstractproperty
     def _frequency(self):
-        pass
-
-    @abstractproperty
-    def _prefetch_length(self):
         pass
 
     @abstractproperty
@@ -343,6 +346,21 @@ class HistoryLoader(with_metaclass(ABCMeta)):
     @abstractmethod
     def _array(self, start, end, assets, field):
         pass
+
+    def _decimal_places_for_asset(self, asset, reference_date):
+        if isinstance(asset, Future) and asset.tick_size:
+            return number_of_decimal_places(asset.tick_size)
+        elif isinstance(asset, ContinuousFuture):
+            # Tick size should be the same for all contracts of a continuous
+            # future, so arbitrarily get the contract with next upcoming auto
+            # close date.
+            oc = self._asset_finder.get_ordered_contracts(asset.root_symbol)
+            contract_sid = oc.contract_before_auto_close(reference_date.value)
+            if contract_sid is not None:
+                contract = self._asset_finder.retrieve_asset(contract_sid)
+                if contract.tick_size:
+                    return number_of_decimal_places(contract.tick_size)
+        return DEFAULT_ASSET_PRICE_DECIMALS
 
     def _ensure_sliding_windows(self, assets, dts, field,
                                 is_perspective_after):
@@ -378,34 +396,38 @@ class HistoryLoader(with_metaclass(ABCMeta)):
         size = len(dts)
         asset_windows = {}
         needed_assets = []
+        cal = self._calendar
 
         assets = self._asset_finder.retrieve_all(assets)
+        end_ix = find_in_sorted_index(cal, end)
 
         for asset in assets:
             try:
-                asset_windows[asset] = self._window_blocks[field].get(
+                window = self._window_blocks[field].get(
                     (asset, size, is_perspective_after), end)
             except KeyError:
                 needed_assets.append(asset)
+            else:
+                if end_ix < window.most_recent_ix:
+                    # Window needs reset. Requested end index occurs before the
+                    # end index from the previous history call for this window.
+                    # Grab new window instead of rewinding adjustments.
+                    needed_assets.append(asset)
+                else:
+                    asset_windows[asset] = window
 
         if needed_assets:
-            start = dts[0]
-
             offset = 0
-            try:
-                start_ix = self._calendar.get_loc(start)
-            except KeyError:
-                raise KeyError("{0} not in calendar [{1}...{2}]".format(
-                    start, self._calendar[0], self._calendar[-1]))
-            try:
-                end_ix = self._calendar.get_loc(end)
-            except KeyError:
-                raise KeyError("{0} not in calendar [{1}...{2}]".format(
-                    end, self._calendar[0], self._calendar[-1]))
-            cal = self._calendar
+            start_ix = find_in_sorted_index(cal, dts[0])
+
             prefetch_end_ix = min(end_ix + self._prefetch_length, len(cal) - 1)
             prefetch_end = cal[prefetch_end_ix]
             prefetch_dts = cal[start_ix:prefetch_end_ix + 1]
+            if is_perspective_after:
+                adj_end_ix = min(prefetch_end_ix + 1, len(cal) - 1)
+                adj_dts = cal[start_ix:adj_end_ix + 1]
+            else:
+                adj_dts = prefetch_dts
             prefetch_len = len(prefetch_dts)
             array = self._array(prefetch_dts, needed_assets, field)
 
@@ -426,7 +448,7 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                     adj_reader = None
                 if adj_reader is not None:
                     adjs = adj_reader.load_adjustments(
-                        [field], prefetch_dts, [asset])[0]
+                        [field], adj_dts, [asset])[0]
                 else:
                     adjs = {}
                 window = window_type(
@@ -435,7 +457,8 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                     adjs,
                     offset,
                     size,
-                    int(is_perspective_after)
+                    int(is_perspective_after),
+                    self._decimal_places_for_asset(asset, dts[-1]),
                 )
                 sliding_window = SlidingWindow(window, size, start_ix, offset)
                 asset_windows[asset] = sliding_window
@@ -525,12 +548,12 @@ class HistoryLoader(with_metaclass(ABCMeta)):
                                              dts,
                                              field,
                                              is_perspective_after)
-        end_ix = self._calendar.get_loc(dts[-1])
+        end_ix = self._calendar.searchsorted(dts[-1])
 
         return concatenate(
             [window.get(end_ix) for window in block],
             axis=1,
-        ).round(3)
+        )
 
 
 class DailyHistoryLoader(HistoryLoader):
@@ -538,10 +561,6 @@ class DailyHistoryLoader(HistoryLoader):
     @property
     def _frequency(self):
         return 'daily'
-
-    @property
-    def _prefetch_length(self):
-        return 40
 
     @property
     def _calendar(self):
@@ -562,15 +581,12 @@ class MinuteHistoryLoader(HistoryLoader):
     def _frequency(self):
         return 'minute'
 
-    @property
-    def _prefetch_length(self):
-        return 1560
-
     @lazyval
     def _calendar(self):
         mm = self.trading_calendar.all_minutes
-        return mm[mm.slice_indexer(start=self._reader.first_trading_day,
-                                   end=self._reader.last_available_dt)]
+        start = mm.searchsorted(self._reader.first_trading_day)
+        end = mm.searchsorted(self._reader.last_available_dt, side='right')
+        return mm[start:end]
 
     def _array(self, dts, assets, field):
         return self._reader.load_raw_arrays(

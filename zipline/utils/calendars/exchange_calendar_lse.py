@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from datetime import time
-from pandas.tseries.holiday import(
+from pandas.tseries.holiday import (
     Holiday,
     DateOffset,
     MO,
@@ -28,7 +28,8 @@ from .trading_calendar import (
     TradingCalendar,
     MONDAY,
     TUESDAY,
-    HolidayCalendar)
+    HolidayCalendar
+)
 
 # New Year's Day
 LSENewYearsDay = Holiday(

@@ -1,6 +1,5 @@
 import errno
 import os
-from functools import wraps
 
 import click
 import logbook
@@ -8,6 +7,8 @@ import pandas as pd
 from six import text_type
 
 from zipline.data import bundles as bundles_module
+from zipline.utils.calendars.calendar_utils import get_calendar
+from zipline.utils.compat import wraps
 from zipline.utils.cli import Date, Timestamp
 from zipline.utils.run_algo import _run, load_extensions
 
@@ -138,7 +139,7 @@ def ipython_only(option):
 @click.option(
     '-b',
     '--bundle',
-    default='quantopian-quandl',
+    default='quandl',
     metavar='BUNDLE-NAME',
     show_default=True,
     help='The data bundle to use for the simulation.',
@@ -173,6 +174,12 @@ def ipython_only(option):
     " be written to stdout.",
 )
 @click.option(
+    '--trading-calendar',
+    metavar='TRADING-CALENDAR',
+    default='NYSE',
+    help="The calendar you want to use e.g. LSE. NYSE is the default."
+)
+@click.option(
     '--print-algo/--no-print-algo',
     is_flag=True,
     default=False,
@@ -196,6 +203,7 @@ def run(ctx,
         start,
         end,
         output,
+        trading_calendar,
         print_algo,
         local_namespace):
     """Run a backtest for the given algorithm.
@@ -219,6 +227,8 @@ def run(ctx,
             " '-t' / '--algotext'",
         )
 
+    trading_calendar = get_calendar(trading_calendar)
+
     perf = _run(
         initialize=None,
         handle_data=None,
@@ -235,6 +245,7 @@ def run(ctx,
         start=start,
         end=end,
         output=output,
+        trading_calendar=trading_calendar,
         print_algo=print_algo,
         local_namespace=local_namespace,
         environ=os.environ,
@@ -285,7 +296,7 @@ def zipline_magic(line, cell=None):
 @click.option(
     '-b',
     '--bundle',
-    default='quantopian-quandl',
+    default='quandl',
     metavar='BUNDLE-NAME',
     show_default=True,
     help='The data bundle to ingest.',
@@ -317,13 +328,13 @@ def ingest(bundle, assets_version, show_progress):
 @click.option(
     '-b',
     '--bundle',
-    default='quantopian-quandl',
+    default='quandl',
     metavar='BUNDLE-NAME',
     show_default=True,
     help='The data bundle to clean.',
 )
 @click.option(
-    '-b',
+    '-e',
     '--before',
     type=Timestamp(),
     help='Clear all data before TIMESTAMP.'
@@ -342,7 +353,7 @@ def ingest(bundle, assets_version, show_progress):
     type=int,
     metavar='N',
     help='Clear all but the last N downloads.'
-    ' This may not be passed with -b / --before or -a / --after',
+    ' This may not be passed with -e / --before or -a / --after',
 )
 def clean(bundle, before, after, keep_last):
     """Clean up data downloaded with the ingest command.

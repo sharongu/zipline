@@ -1,7 +1,7 @@
 """
 Caching utilities for zipline
 """
-from collections import namedtuple, MutableMapping
+from collections import MutableMapping
 import errno
 import os
 import pickle
@@ -13,6 +13,7 @@ import pandas as pd
 
 from .context_tricks import nop_context
 from .paths import ensure_directory
+from .sentinel import sentinel
 
 
 class Expired(Exception):
@@ -20,7 +21,11 @@ class Expired(Exception):
     """
 
 
-class CachedObject(namedtuple("_CachedObject", "value expires")):
+ExpiredCachedObject = sentinel('ExpiredCachedObject')
+AlwaysExpired = sentinel('AlwaysExpired')
+
+
+class CachedObject(object):
     """
     A simple struct for maintaining a cached object with an expiration date.
 
@@ -32,8 +37,8 @@ class CachedObject(namedtuple("_CachedObject", "value expires")):
         Expiration date of `value`. The cache is considered invalid for dates
         **strictly greater** than `expires`.
 
-    Usage
-    -----
+    Examples
+    --------
     >>> from pandas import Timestamp, Timedelta
     >>> expires = Timestamp('2014', tz='UTC')
     >>> obj = CachedObject(1, expires)
@@ -47,6 +52,15 @@ class CachedObject(namedtuple("_CachedObject", "value expires")):
         ...
     Expired: 2014-01-01 00:00:00+00:00
     """
+    def __init__(self, value, expires):
+        self._value = value
+        self._expires = expires
+
+    @classmethod
+    def expired(cls):
+        """Construct a CachedObject that's expired at any time.
+        """
+        return cls(ExpiredCachedObject, expires=AlwaysExpired)
 
     def unwrap(self, dt):
         """
@@ -62,9 +76,14 @@ class CachedObject(namedtuple("_CachedObject", "value expires")):
         Expired
             Raised when `dt` is greater than self.expires.
         """
-        if dt > self.expires:
-            raise Expired(self.expires)
-        return self.value
+        expires = self._expires
+        if expires is AlwaysExpired or expires < dt:
+            raise Expired(self._expires)
+        return self._value
+
+    def _unsafe_get_value(self):
+        """You almost certainly shouldn't use this."""
+        return self._value
 
 
 class ExpiringCache(object):
@@ -79,8 +98,13 @@ class ExpiringCache(object):
         `__del__`, `__getitem__`, `__setitem__`
         If `None`, than a dict is used as a default.
 
-    Usage
-    -----
+    cleanup : callable, optional
+        A method that takes a single argument, a cached object, and is called
+        upon expiry of the cached object, prior to deleting the object. If not
+        provided, defaults to a no-op.
+
+    Examples
+    --------
     >>> from pandas import Timestamp, Timedelta
     >>> expires = Timestamp('2014', tz='UTC')
     >>> value = 1
@@ -94,11 +118,13 @@ class ExpiringCache(object):
     KeyError: 'foo'
     """
 
-    def __init__(self, cache=None):
+    def __init__(self, cache=None, cleanup=lambda value_to_clean: None):
         if cache is not None:
             self._cache = cache
         else:
             self._cache = {}
+
+        self.cleanup = cleanup
 
     def get(self, key, dt):
         """Get the value of a cached object.
@@ -124,6 +150,7 @@ class ExpiringCache(object):
         try:
             return self._cache[key].unwrap(dt)
         except Expired:
+            self.cleanup(self._cache[key]._unsafe_get_value())
             del self._cache[key]
             raise KeyError(key)
 

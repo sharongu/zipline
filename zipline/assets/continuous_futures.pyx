@@ -29,11 +29,51 @@ from cpython.object cimport (
 )
 from cpython cimport bool
 
-from numpy import empty
+from functools import partial
+
+from numpy import array, empty, iinfo
 from numpy cimport long_t, int64_t
+from pandas import Timestamp
 import warnings
 
 from zipline.utils.calendars import get_calendar
+
+
+def delivery_predicate(codes, contract):
+    # This relies on symbols that are construct following a pattern of
+    # root symbol + delivery code + year, e.g. PLF16
+    # This check would be more robust if the future contract class had
+    # a 'delivery_month' member.
+    delivery_code = contract.symbol[-3]
+    return delivery_code in codes
+
+march_cycle_delivery_predicate = partial(delivery_predicate,
+                                         set(['H', 'M', 'U', 'Z']))
+
+CHAIN_PREDICATES = {
+    'EL': march_cycle_delivery_predicate,
+    'ME': march_cycle_delivery_predicate,
+    'PL': partial(delivery_predicate, set(['F', 'J', 'N', 'V'])),
+    'PA': march_cycle_delivery_predicate,
+
+    # The majority of trading in these currency futures is done on a
+    # March quarterly cycle (Mar, Jun, Sep, Dec) but contracts are
+    # listed for the first 3 consecutive months from the present day. We
+    # want the continuous futures to be composed of just the quarterly
+    # contracts.
+    'JY': march_cycle_delivery_predicate,
+    'CD': march_cycle_delivery_predicate,
+    'AD': march_cycle_delivery_predicate,
+    'BP': march_cycle_delivery_predicate,
+
+    # Gold and silver contracts trade on an unusual specific set of months.
+    'GC': partial(delivery_predicate, set(['G', 'J', 'M', 'Q', 'V', 'Z'])),
+    'XG': partial(delivery_predicate, set(['G', 'J', 'M', 'Q', 'V', 'Z'])),
+    'SV': partial(delivery_predicate, set(['H', 'K', 'N', 'U', 'Z'])),
+    'YS': partial(delivery_predicate, set(['H', 'K', 'N', 'U', 'Z'])),
+}
+
+ADJUSTMENT_STYLES = {'add', 'mul', None}
 
 
 cdef class ContinuousFuture:
@@ -66,7 +106,6 @@ cdef class ContinuousFuture:
     cdef readonly object exchange
 
     cdef readonly object adjustment
-    cdef readonly object _adjustment_children
 
     _kwargnames = frozenset({
         'sid',
@@ -85,8 +124,7 @@ cdef class ContinuousFuture:
                  object start_date,
                  object end_date,
                  object exchange,
-                 object adjustment=None,
-                 dict adjustment_children=None):
+                 object adjustment=None):
 
         self.sid = sid
         self.sid_hash = hash(sid)
@@ -97,7 +135,6 @@ cdef class ContinuousFuture:
         self.start_date = start_date
         self.end_date = end_date
         self.adjustment = adjustment
-        self._adjustment_children = adjustment_children
 
 
     def __int__(self):
@@ -235,11 +272,33 @@ cdef class ContinuousFuture:
         calendar = get_calendar(self.exchange)
         return calendar.is_open_on_minute(dt_minute)
 
-    def adj(self, style):
-        try:
-            return self._adjustment_children[style]
-        except KeyError:
-            return None
+
+cdef class ContractNode(object):
+
+    cdef readonly object contract
+    cdef public object prev
+    cdef public object next
+
+    def __init__(self, contract):
+        self.contract = contract
+        self.prev = None
+        self.next = None
+
+    def __rshift__(self, offset):
+        i = 0
+        curr = self
+        while i < offset and curr is not None:
+            curr = curr.next
+            i += 1
+        return curr
+
+    def __lshift__(self, offset):
+        i = 0
+        curr = self
+        while i < offset and curr is not None:
+            curr = curr.prev
+            i += 1
+        return curr
 
 
 cdef class OrderedContracts(object):
@@ -249,90 +308,117 @@ cdef class OrderedContracts(object):
     Used to get answers about contracts in relation to their auto close
     dates and start dates.
 
-    The number of contracts for a given root symbol is ~250,
-    which is why search by comparison over the range of contracts is
-    used. At this size, this is faster than using an index or np.searchsorted.
-
     Members
     -------
     root_symbol : str
         The root symbol of the future contract chain.
-    contract_sids : long[:]
-        The contract sids in sorted order of occurrence.
+    contracts : deque
+        The contracts in the chain in order of occurrence.
     start_dates : long[:]
         The start dates of the contracts in the chain.
         Corresponds by index with contract_sids.
     auto_close_dates : long[:]
         The auto close dates of the contracts in the chain.
         Corresponds by index with contract_sids.
+    future_chain_predicates : dict
+        A dict mapping root symbol to a predicate function which accepts a contract
+    as a parameter and returns whether or not the contract should be included in the
+    chain.
 
     Instances of this class are used by the simulation engine, but not
     exposed to the algorithm.
     """
 
     cdef readonly object root_symbol
-    cdef int _size
-    cdef readonly long_t[:] contract_sids
-    cdef readonly long_t[:] start_dates
-    cdef readonly long_t[:] auto_close_dates
+    cdef readonly object _head_contract
+    cdef readonly dict sid_to_contract
+    cdef readonly int64_t _start_date
+    cdef readonly int64_t _end_date
+    cdef readonly object chain_predicate
 
-    def __init__(self,
-                 object root_symbol,
-                 long_t[:] contract_sids,
-                 long_t[:] start_dates,
-                 long_t[:] auto_close_dates):
-        self._size = len(contract_sids)
+    def __init__(self, object root_symbol, object contracts, object chain_predicate=None):
+
         self.root_symbol = root_symbol
-        self.contract_sids = contract_sids
-        self.start_dates = start_dates
-        self.auto_close_dates = auto_close_dates
-    
+
+        self.sid_to_contract = {}
+
+        self._start_date = iinfo('int64').max
+        self._end_date = 0
+
+        if chain_predicate is None:
+            chain_predicate = lambda x: True
+
+        self._head_contract = None
+        prev = None
+        while contracts:
+            contract = contracts.popleft()
+
+            # It is possible that the first contract in our list has a start
+            # date on or after its auto close date. In that case the contract
+            # is not tradable, so do not include it in the chain.
+            if prev is None and contract.start_date >= contract.auto_close_date:
+                continue
+
+            if not chain_predicate(contract):
+                continue
+
+            self._start_date = min(contract.start_date.value, self._start_date)
+            self._end_date = max(contract.end_date.value, self._end_date)
+
+            curr = ContractNode(contract)
+            self.sid_to_contract[contract.sid] = curr
+            if self._head_contract is None:
+                self._head_contract = curr
+                prev = curr
+                continue
+            curr.prev = prev
+            prev.next = curr
+            prev = curr
+
     cpdef long_t contract_before_auto_close(self, long_t dt_value):
         """
         Get the contract with next upcoming auto close date.
         """
-        cdef Py_ssize_t i, auto_close_date
-        for i, auto_close_date in enumerate(self.auto_close_dates):
-            if auto_close_date > dt_value:
+        curr = self._head_contract
+        while curr.next is not None:
+            if curr.contract.auto_close_date.value > dt_value:
                 break
-        return self.contract_sids[i]
+            curr = curr.next
+        return curr.contract.sid
 
     cpdef contract_at_offset(self, long_t sid, Py_ssize_t offset, int64_t start_cap):
         """
         Get the sid which is the given sid plus the offset distance.
         An offset of 0 should be reflexive.
         """
-        cdef Py_ssize_t i, j
-        cdef long_t[:] sids
-        sids = self.contract_sids
-        start_dates = self.start_dates
+        cdef Py_ssize_t i
+        curr = self.sid_to_contract[sid]
         i = 0
-        j = i + offset
-        while j < self._size:
-            if sid == sids[i]:
-                if start_dates[j] < start_cap:
-                    return sids[j]
-                else:
-                    return None
+        while i < offset:
+            if curr.next is None:
+                return None
+            curr = curr.next
             i += 1
-            j += 1
+        if curr.contract.start_date.value <= start_cap:
+            return curr.contract.sid
+        else:
+            return None
 
     cpdef long_t[:] active_chain(self, long_t starting_sid, long_t dt_value):
-        cdef Py_ssize_t left, right, i, j
-        cdef long_t[:] sids, start_dates
-        left = 0
-        right = self._size
-        sids = self.contract_sids
-        start_dates = self.start_dates
+        curr = self.sid_to_contract[starting_sid]
+        cdef list contracts = []
 
-        for i in range(self._size):
-            if starting_sid == sids[i]:
-                left = i
-                break
+        while curr is not None:
+            if curr.contract.start_date.value <= dt_value:
+                contracts.append(curr.contract.sid)
+            curr = curr.next
 
-        for j in range(i, self._size):
-            if start_dates[j] > dt_value:
-                right = j
-                break
+        return array(contracts, dtype='int64')
 
-        return sids[left:right]
+    property start_date:
+        def __get__(self):
+            return Timestamp(self._start_date, tz='UTC')
+
+    property end_date:
+        def __get__(self):
+            return Timestamp(self._end_date, tz='UTC')

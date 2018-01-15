@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import Iterable
 from copy import copy
 import operator as op
 import warnings
@@ -37,36 +38,39 @@ from six import (
 from zipline._protocol import handle_non_market_minutes
 from zipline.assets.synthetic import make_simple_equity_info
 from zipline.data.data_portal import DataPortal
+from zipline.data.resample import minute_panel_to_session_panel
 from zipline.data.us_equity_pricing import PanelBarReader
 from zipline.errors import (
     AttachPipelineAfterInitialize,
+    CannotOrderDelistedAsset,
+    DuplicatePipelineName,
     HistoryInInitialize,
+    IncompatibleCommissionModel,
+    IncompatibleSlippageModel,
     NoSuchPipeline,
     OrderDuringInitialize,
+    OrderInBeforeTradingStart,
     PipelineOutputDuringInitialize,
     RegisterAccountControlPostInit,
     RegisterTradingControlPostInit,
+    ScheduleFunctionInvalidCalendar,
     SetBenchmarkOutsideInitialize,
+    SetCancelPolicyPostInit,
     SetCommissionPostInit,
     SetSlippagePostInit,
-    UnsupportedCommissionModel,
+    UnsupportedCancelPolicy,
     UnsupportedDatetimeFormat,
     UnsupportedOrderParameters,
-    UnsupportedSlippageModel,
-    CannotOrderDelistedAsset,
-    UnsupportedCancelPolicy,
-    SetCancelPolicyPostInit,
-    OrderInBeforeTradingStart
 )
 from zipline.finance.trading import TradingEnvironment
 from zipline.finance.blotter import Blotter
-from zipline.finance.commission import PerShare, CommissionModel
 from zipline.finance.controls import (
     LongOnly,
     MaxOrderCount,
     MaxOrderSize,
     MaxPositionSize,
     MaxLeverage,
+    MinLeverage,
     RestrictedListOrder
 )
 from zipline.finance.execution import (
@@ -77,17 +81,13 @@ from zipline.finance.execution import (
 )
 from zipline.finance.performance import PerformanceTracker
 from zipline.finance.asset_restrictions import Restrictions
-from zipline.finance.slippage import (
-    VolumeShareSlippage,
-    SlippageModel
-)
 from zipline.finance.cancel_policy import NeverCancel, CancelPolicy
 from zipline.finance.asset_restrictions import (
     NoRestrictions,
     StaticRestrictions,
     SecurityListRestrictions,
 )
-from zipline.assets import Asset, Future
+from zipline.assets import Asset, Equity, Future
 from zipline.gens.tradesimulation import AlgorithmSimulator
 from zipline.pipeline import Pipeline
 from zipline.pipeline.engine import (
@@ -104,12 +104,15 @@ from zipline.utils.input_validation import (
     coerce_string,
     ensure_upper_case,
     error_keywords,
+    expect_dtypes,
     expect_types,
     optional,
 )
+from zipline.utils.numpy_utils import int64_dtype
 from zipline.utils.calendars.trading_calendar import days_at_time
-from zipline.utils.cache import CachedObject, Expired
+from zipline.utils.cache import ExpiringCache
 from zipline.utils.calendars import get_calendar
+from zipline.utils.pandas_utils import clear_dataframe_indexer_caches
 
 import zipline.utils.events
 from zipline.utils.events import (
@@ -117,13 +120,14 @@ from zipline.utils.events import (
     make_eventrule,
     date_rules,
     time_rules,
+    calendars,
     AfterOpen,
     BeforeClose
 )
 from zipline.utils.factory import create_simulation_parameters
 from zipline.utils.math_utils import (
     tolerant_equals,
-    round_if_near_integer
+    round_if_near_integer,
 )
 from zipline.utils.preprocess import preprocess
 from zipline.utils.security_list import SecurityList
@@ -134,8 +138,6 @@ from zipline.sources.requests_csv import PandasRequestsCSV
 from zipline.gens.sim_engine import MinuteSimulationClock
 from zipline.sources.benchmark_source import BenchmarkSource
 from zipline.zipline_warnings import ZiplineDeprecationWarning
-
-DEFAULT_CAPITAL_BASE = 1e5
 
 
 log = logbook.Logger("ZiplineLog")
@@ -172,8 +174,6 @@ class TradingAlgorithm(object):
         tracebacks. default: '<string>'.
     data_frequency : {'daily', 'minute'}, optional
         The duration of the bars.
-    capital_base : float, optional
-        How much capital to start with. default: 1.0e5
     instant_fill : bool, optional
         Whether to fill orders immediately or on next bar. default: False
     equities_metadata : dict or DataFrame or file-like object, optional
@@ -291,15 +291,12 @@ class TradingAlgorithm(object):
         # If a schedule has been provided, pop it. Otherwise, use NYSE.
         self.trading_calendar = kwargs.pop(
             'trading_calendar',
-            get_calendar("NYSE")
+            get_calendar('NYSE')
         )
 
-        # set the capital base
-        self.capital_base = kwargs.pop('capital_base', DEFAULT_CAPITAL_BASE)
         self.sim_params = kwargs.pop('sim_params', None)
         if self.sim_params is None:
             self.sim_params = create_simulation_parameters(
-                capital_base=self.capital_base,
                 start=kwargs.pop('start', None),
                 end=kwargs.pop('end', None),
                 trading_calendar=self.trading_calendar,
@@ -312,20 +309,20 @@ class TradingAlgorithm(object):
         # Initialize Pipeline API data.
         self.init_engine(kwargs.pop('get_pipeline_loader', None))
         self._pipelines = {}
-        # Create an always-expired cache so that we compute the first time data
-        # is requested.
-        self._pipeline_cache = CachedObject(None, pd.Timestamp(0, tz='UTC'))
+
+        # Create an already-expired cache so that we compute the first time
+        # data is requested.
+        self._pipeline_cache = ExpiringCache(
+            cleanup=clear_dataframe_indexer_caches
+        )
 
         self.blotter = kwargs.pop('blotter', None)
         self.cancel_policy = kwargs.pop('cancel_policy', NeverCancel())
         if not self.blotter:
             self.blotter = Blotter(
                 data_frequency=self.data_frequency,
-                asset_finder=self.asset_finder,
-                slippage_func=VolumeShareSlippage(),
-                commission=PerShare(),
                 # Default to NeverCancel in zipline
-                cancel_policy=self.cancel_policy
+                cancel_policy=self.cancel_policy,
             )
 
         # The symbol lookup date specifies the date to use when resolving
@@ -466,11 +463,6 @@ class TradingAlgorithm(object):
         if self._handle_data:
             self._handle_data(self, data)
 
-        # Unlike trading controls which remain constant unless placing an
-        # order, account controls can change each bar. Thus, must check
-        # every bar no matter if the algorithm places an order or not.
-        self.validate_account_controls()
-
     def analyze(self, perf):
         if self._analyze is None:
             return
@@ -491,16 +483,16 @@ class TradingAlgorithm(object):
     capital_base={capital_base}
     sim_params={sim_params},
     initialized={initialized},
-    slippage={slippage},
-    commission={commission},
+    slippage_models={slippage_models},
+    commission_models={commission_models},
     blotter={blotter},
     recorded_vars={recorded_vars})
 """.strip().format(class_name=self.__class__.__name__,
-                   capital_base=self.capital_base,
+                   capital_base=self.sim_params.capital_base,
                    sim_params=repr(self.sim_params),
                    initialized=self.initialized,
-                   slippage=repr(self.blotter.slippage_func),
-                   commission=repr(self.blotter.commission),
+                   slippage_models=repr(self.blotter.slippage_models),
+                   commission_models=repr(self.blotter.commission_models),
                    blotter=repr(self.blotter),
                    recorded_vars=repr(self.recorded_vars))
 
@@ -522,6 +514,17 @@ class TradingAlgorithm(object):
             # as the last minute of the session.
             market_opens = market_closes
 
+        # The calendar's execution times are the minutes over which we actually
+        # want to run the clock. Typically the execution times simply adhere to
+        # the market open and close times. In the case of the futures calendar,
+        # for example, we only want to simulate over a subset of the full 24
+        # hour calendar, so the execution times dictate a market open time of
+        # 6:31am US/Eastern and a close of 5:00pm US/Eastern.
+        execution_opens = \
+            self.trading_calendar.execution_time_from_open(market_opens)
+        execution_closes = \
+            self.trading_calendar.execution_time_from_close(market_closes)
+
         # FIXME generalize these values
         before_trading_start_minutes = days_at_time(
             self.sim_params.sessions,
@@ -531,20 +534,29 @@ class TradingAlgorithm(object):
 
         return MinuteSimulationClock(
             self.sim_params.sessions,
-            market_opens,
-            market_closes,
+            execution_opens,
+            execution_closes,
             before_trading_start_minutes,
             minute_emission=minutely_emission,
         )
 
     def _create_benchmark_source(self):
+        if self.benchmark_sid is not None:
+            benchmark_asset = self.asset_finder.retrieve_asset(
+                self.benchmark_sid)
+            benchmark_returns = None
+        else:
+            benchmark_asset = None
+            # get benchmark info from trading environment, which defaults to
+            # downloading data from IEX Trading.
+            benchmark_returns = self.trading_environment.benchmark_returns
         return BenchmarkSource(
-            benchmark_sid=self.benchmark_sid,
-            env=self.trading_environment,
+            benchmark_asset=benchmark_asset,
             trading_calendar=self.trading_calendar,
             sessions=self.sim_params.sessions,
             data_portal=self.data_portal,
             emission_rate=self.sim_params.emission_rate,
+            benchmark_returns=benchmark_returns,
         )
 
     def _create_generator(self, sim_params):
@@ -557,7 +569,7 @@ class TradingAlgorithm(object):
             self.perf_tracker = PerformanceTracker(
                 sim_params=self.sim_params,
                 trading_calendar=self.trading_calendar,
-                env=self.trading_environment,
+                asset_finder=self.asset_finder,
             )
 
             # Set the dt initially to the period start by forcing it to change.
@@ -669,21 +681,33 @@ class TradingAlgorithm(object):
                     )
                 )
 
-                if self.sim_params.data_frequency == 'daily':
-                    equity_reader_arg = 'equity_daily_reader'
-                elif self.sim_params.data_frequency == 'minute':
-                    equity_reader_arg = 'equity_minute_reader'
                 equity_reader = PanelBarReader(
                     self.trading_calendar,
                     copy_panel,
                     self.sim_params.data_frequency,
                 )
+                if self.sim_params.data_frequency == 'daily':
+                    equity_readers = {
+                        'equity_daily_reader': equity_reader,
+                    }
+                elif self.sim_params.data_frequency == 'minute':
+                    equity_readers = {
+                        'equity_minute_reader': equity_reader,
+                        'equity_daily_reader': PanelBarReader(
+                            self.trading_calendar,
+                            minute_panel_to_session_panel(
+                                copy_panel,
+                                self.trading_calendar,
+                            ),
+                            'daily',
+                        ),
+                    }
 
                 self.data_portal = DataPortal(
                     self.asset_finder,
                     self.trading_calendar,
                     first_trading_day=equity_reader.first_trading_day,
-                    **{equity_reader_arg: equity_reader}
+                    **equity_readers
                 )
 
         # Force a reset of the performance tracker, in case
@@ -1073,6 +1097,8 @@ class TradingAlgorithm(object):
             The rule for the times to execute this function.
         half_days : bool, optional
             Should this rule fire on half days?
+        calendar : Sentinel, optional
+            Calendar used to reconcile date and time rules.
 
         See Also
         --------
@@ -1098,7 +1124,19 @@ class TradingAlgorithm(object):
         # Check the type of the algorithm's schedule before pulling calendar
         # Note that the ExchangeTradingSchedule is currently the only
         # TradingSchedule class, so this is unlikely to be hit
-        cal = calendar or self.trading_calendar
+        if calendar is None:
+            cal = self.trading_calendar
+        elif calendar is calendars.US_EQUITIES:
+            cal = get_calendar('NYSE')
+        elif calendar is calendars.US_FUTURES:
+            cal = get_calendar('us_futures')
+        else:
+            raise ScheduleFunctionInvalidCalendar(
+                given_calendar=calendar,
+                allowed_calendars=(
+                    '[calendars.US_EQUITIES, calendars.US_FUTURES]'
+                ),
+            )
 
         self.add_event(
             make_eventrule(date_rule, time_rule, cal, half_days),
@@ -1177,7 +1215,8 @@ class TradingAlgorithm(object):
         """
         # If the user has not set the symbol lookup date,
         # use the end_session as the date for sybmol->sid resolution.
-        _lookup_date = self._symbol_lookup_date if self._symbol_lookup_date is not None \
+        _lookup_date = self._symbol_lookup_date \
+            if self._symbol_lookup_date is not None \
             else self.sim_params.end_session
 
         return self.asset_finder.lookup_symbol(
@@ -1187,7 +1226,11 @@ class TradingAlgorithm(object):
 
     @api_method
     @preprocess(root_symbol_str=ensure_upper_case)
-    def continuous_future(self, root_symbol_str, offset, roll):
+    def continuous_future(self,
+                          root_symbol_str,
+                          offset=0,
+                          roll='volume',
+                          adjustment='mul'):
         """Create a specifier for a continuous contract.
 
         Parameters
@@ -1195,11 +1238,15 @@ class TradingAlgorithm(object):
         root_symbol_str : str
             The root symbol for the future chain.
 
-        offset : int
-            The distance from the primary contract.
+        offset : int, optional
+            The distance from the primary contract. Default is 0.
 
-        roll_style : str
-            How rolls are determined.
+        roll_style : str, optional
+            How rolls are determined. Default is 'volume'.
+
+        adjustment : str, optional
+            Method for adjusting lookback prices between rolls. Options are
+            'mul', 'add', and None. Default is 'mul'.
 
         Returns
         -------
@@ -1210,6 +1257,7 @@ class TradingAlgorithm(object):
             root_symbol_str,
             offset,
             roll,
+            adjustment,
         )
 
     @api_method
@@ -1339,10 +1387,10 @@ class TradingAlgorithm(object):
         if asset.auto_close_date:
             day = normalize_date(self.get_datetime())
 
-            if asset.end_date < day < asset.auto_close_date:
-                # we are between the asset's end date and auto close date,
-                # so warn the user that they can't place an order for this
-                # asset, and return None.
+            if day > min(asset.end_date, asset.auto_close_date):
+                # If we are after the asset's end date or auto close date, warn
+                # the user that they can't place an order for this asset, and
+                # return None.
                 log.warn("Cannot place order for {0}, as it has de-listed. "
                          "Any existing positions for this asset will be "
                          "liquidated on "
@@ -1379,8 +1427,9 @@ class TradingAlgorithm(object):
 
         Returns
         -------
-        order_id : str
-            The unique identifier for this order.
+        order_id : str or None
+            The unique identifier for this order, or None if no order was
+            placed.
 
         Notes
         -----
@@ -1401,10 +1450,13 @@ class TradingAlgorithm(object):
         if not self._can_order_asset(asset):
             return None
 
-        # Truncate to the integer share count that's either within .0001 of
-        # amount or closer to zero.
-        # E.g. 3.9999 -> 4.0; 5.5 -> 5.0; -5.5 -> -5.0
-        amount = int(round_if_near_integer(amount))
+        amount, style = self._calculate_order(asset, amount,
+                                              limit_price, stop_price, style)
+        return self.blotter.order(asset, amount, style)
+
+    def _calculate_order(self, asset, amount,
+                         limit_price=None, stop_price=None, style=None):
+        amount = self.round_order(amount)
 
         # Raises a ZiplineError if invalid parameters are detected.
         self.validate_order_params(asset,
@@ -1418,7 +1470,19 @@ class TradingAlgorithm(object):
         style = self.__convert_order_params_for_blotter(limit_price,
                                                         stop_price,
                                                         style)
-        return self.blotter.order(asset, amount, style)
+        return amount, style
+
+    @staticmethod
+    def round_order(amount):
+        """
+        Convert number of shares to an integer.
+
+        By default, truncates to the integer share count that's either within
+        .0001 of amount or closer to zero.
+
+        E.g. 3.9999 -> 4.0; 5.5 -> 5.0; -5.5 -> -5.0
+        """
+        return int(round_if_near_integer(amount))
 
     def validate_order_params(self,
                               asset,
@@ -1607,32 +1671,51 @@ class TradingAlgorithm(object):
         return dt
 
     @api_method
-    def set_slippage(self, slippage):
-        """Set the slippage model for the simulation.
+    def set_slippage(self, us_equities=None, us_futures=None):
+        """Set the slippage models for the simulation.
 
         Parameters
         ----------
-        slippage : SlippageModel
-            The slippage model to use.
+        us_equities : EquitySlippageModel
+            The slippage model to use for trading US equities.
+        us_futures : FutureSlippageModel
+            The slippage model to use for trading US futures.
 
         See Also
         --------
         :class:`zipline.finance.slippage.SlippageModel`
         """
-        if not isinstance(slippage, SlippageModel):
-            raise UnsupportedSlippageModel()
         if self.initialized:
             raise SetSlippagePostInit()
-        self.blotter.slippage_func = slippage
+
+        if us_equities is not None:
+            if Equity not in us_equities.allowed_asset_types:
+                raise IncompatibleSlippageModel(
+                    asset_type='equities',
+                    given_model=us_equities,
+                    supported_asset_types=us_equities.allowed_asset_types,
+                )
+            self.blotter.slippage_models[Equity] = us_equities
+
+        if us_futures is not None:
+            if Future not in us_futures.allowed_asset_types:
+                raise IncompatibleSlippageModel(
+                    asset_type='futures',
+                    given_model=us_futures,
+                    supported_asset_types=us_futures.allowed_asset_types,
+                )
+            self.blotter.slippage_models[Future] = us_futures
 
     @api_method
-    def set_commission(self, commission):
-        """Sets the commission model for the simulation.
+    def set_commission(self, us_equities=None, us_futures=None):
+        """Sets the commission models for the simulation.
 
         Parameters
         ----------
-        commission : CommissionModel
-            The commission model to use.
+        us_equities : EquityCommissionModel
+            The commission model to use for trading US equities.
+        us_futures : FutureCommissionModel
+            The commission model to use for trading US futures.
 
         See Also
         --------
@@ -1640,13 +1723,26 @@ class TradingAlgorithm(object):
         :class:`zipline.finance.commission.PerTrade`
         :class:`zipline.finance.commission.PerDollar`
         """
-        if not isinstance(commission, CommissionModel):
-            raise UnsupportedCommissionModel()
-
         if self.initialized:
             raise SetCommissionPostInit()
 
-        self.blotter.commission = commission
+        if us_equities is not None:
+            if Equity not in us_equities.allowed_asset_types:
+                raise IncompatibleCommissionModel(
+                    asset_type='equities',
+                    given_model=us_equities,
+                    supported_asset_types=us_equities.allowed_asset_types,
+                )
+            self.blotter.commission_models[Equity] = us_equities
+
+        if us_futures is not None:
+            if Future not in us_futures.allowed_asset_types:
+                raise IncompatibleCommissionModel(
+                    asset_type='futures',
+                    given_model=us_futures,
+                    supported_asset_types=us_futures.allowed_asset_types,
+                )
+            self.blotter.commission_models[Future] = us_futures
 
     @api_method
     def set_cancel_policy(self, cancel_policy):
@@ -1741,11 +1837,15 @@ class TradingAlgorithm(object):
         if not self._can_order_asset(asset):
             return None
 
+        amount = self._calculate_order_percent_amount(asset, percent)
+        return self.order(asset, amount,
+                          limit_price=limit_price,
+                          stop_price=stop_price,
+                          style=style)
+
+    def _calculate_order_percent_amount(self, asset, percent):
         value = self.portfolio.portfolio_value * percent
-        return self.order_value(asset, value,
-                                limit_price=limit_price,
-                                stop_price=stop_price,
-                                style=style)
+        return self._calculate_order_value_amount(asset, value)
 
     @api_method
     @disallowed_in_before_trading_start(OrderInBeforeTradingStart())
@@ -1807,18 +1907,18 @@ class TradingAlgorithm(object):
         if not self._can_order_asset(asset):
             return None
 
+        amount = self._calculate_order_target_amount(asset, target)
+        return self.order(asset, amount,
+                          limit_price=limit_price,
+                          stop_price=stop_price,
+                          style=style)
+
+    def _calculate_order_target_amount(self, asset, target):
         if asset in self.portfolio.positions:
             current_position = self.portfolio.positions[asset].amount
-            req_shares = target - current_position
-            return self.order(asset, req_shares,
-                              limit_price=limit_price,
-                              stop_price=stop_price,
-                              style=style)
-        else:
-            return self.order(asset, target,
-                              limit_price=limit_price,
-                              stop_price=stop_price,
-                              style=style)
+            target -= current_position
+
+        return target
 
     @api_method
     @disallowed_in_before_trading_start(OrderInBeforeTradingStart())
@@ -1882,10 +1982,11 @@ class TradingAlgorithm(object):
             return None
 
         target_amount = self._calculate_order_value_amount(asset, target)
-        return self.order_target(asset, target_amount,
-                                 limit_price=limit_price,
-                                 stop_price=stop_price,
-                                 style=style)
+        amount = self._calculate_order_target_amount(asset, target_amount)
+        return self.order(asset, amount,
+                          limit_price=limit_price,
+                          stop_price=stop_price,
+                          style=style)
 
     @api_method
     @disallowed_in_before_trading_start(OrderInBeforeTradingStart())
@@ -1901,7 +2002,7 @@ class TradingAlgorithm(object):
         ----------
         asset : Asset
             The asset that this order is for.
-        percent : float
+        target : float
             The desired percentage of the porfolio value to allocate to
             ``asset``. This is specified as a decimal, for example:
             0.50 means 50%.
@@ -1944,11 +2045,39 @@ class TradingAlgorithm(object):
         if not self._can_order_asset(asset):
             return None
 
-        target_value = self.portfolio.portfolio_value * target
-        return self.order_target_value(asset, target_value,
-                                       limit_price=limit_price,
-                                       stop_price=stop_price,
-                                       style=style)
+        amount = self._calculate_order_target_percent_amount(asset, target)
+        return self.order(asset, amount,
+                          limit_price=limit_price,
+                          stop_price=stop_price,
+                          style=style)
+
+    def _calculate_order_target_percent_amount(self, asset, target):
+        target_amount = self._calculate_order_percent_amount(asset, target)
+        return self._calculate_order_target_amount(asset, target_amount)
+
+    @api_method
+    @expect_types(share_counts=pd.Series)
+    @expect_dtypes(share_counts=int64_dtype)
+    def batch_market_order(self, share_counts):
+        """Place a batch market order for multiple assets.
+
+        Parameters
+        ----------
+        share_counts : pd.Series[Asset -> int]
+            Map from asset to number of shares to order for that asset.
+
+        Returns
+        -------
+        order_ids : pd.Index[str]
+            Index of ids for newly-created orders.
+        """
+        style = MarketOrder()
+        order_args = [
+            (asset, amount, style)
+            for (asset, amount) in iteritems(share_counts)
+            if amount
+        ]
+        return self.blotter.batch_order(order_args)
 
     @error_keywords(sid='Keyword argument `sid` is no longer supported for '
                         'get_open_orders. Use `asset` instead.')
@@ -2041,6 +2170,7 @@ class TradingAlgorithm(object):
                 bar_count,
                 frequency,
                 field,
+                self.data_frequency,
                 ffill,
             )
         else:
@@ -2057,6 +2187,7 @@ class TradingAlgorithm(object):
                 bar_count,
                 frequency,
                 field,
+                self.data_frequency,
                 ffill,
             )
 
@@ -2102,6 +2233,22 @@ class TradingAlgorithm(object):
             be no maximum.
         """
         control = MaxLeverage(max_leverage)
+        self.register_account_control(control)
+
+    @api_method
+    def set_min_leverage(self, min_leverage, grace_period):
+        """
+        Set a limit on the minimum leverage of the algorithm.
+
+        Parameters
+        ----------
+        min_leverage : float
+            The minimum leverage for the algorithm.
+        grace_period : pd.Timedelta
+            The offset from the start date used to enforce a minimum leverage.
+        """
+        deadline = self.sim_params.start_session + grace_period
+        control = MinLeverage(min_leverage, deadline)
         self.register_account_control(control)
 
     ####################
@@ -2259,9 +2406,9 @@ class TradingAlgorithm(object):
     @expect_types(
         pipeline=Pipeline,
         name=string_types,
-        chunksize=optional(int),
+        chunks=(int, Iterable, type(None)),
     )
-    def attach_pipeline(self, pipeline, name, chunksize=None):
+    def attach_pipeline(self, pipeline, name, chunks=None):
         """Register a pipeline to be computed at the start of each day.
 
         Parameters
@@ -2270,10 +2417,11 @@ class TradingAlgorithm(object):
             The pipeline to have computed.
         name : str
             The name of the pipeline.
-        chunksize : int, optional
+        chunks : int or iterator, optional
             The number of days to compute pipeline results for. Increasing
             this number will make it longer to get the first results but
-            may improve the total runtime of the simulation.
+            may improve the total runtime of the simulation. If an iterator
+            is passed, we will run in chunks based on values of the itereator.
 
         Returns
         -------
@@ -2284,15 +2432,17 @@ class TradingAlgorithm(object):
         --------
         :func:`zipline.api.pipeline_output`
         """
-        if self._pipelines:
-            raise NotImplementedError("Multiple pipelines are not supported.")
-        if chunksize is None:
+        if chunks is None:
             # Make the first chunk smaller to get more immediate results:
             # (one week, then every half year)
-            chunks = iter(chain([5], repeat(126)))
-        else:
-            chunks = iter(repeat(int(chunksize)))
-        self._pipelines[name] = pipeline, chunks
+            chunks = chain([5], repeat(126))
+        elif isinstance(chunks, int):
+            chunks = repeat(chunks)
+
+        if name in self._pipelines:
+            raise DuplicatePipelineName(name=name)
+
+        self._pipelines[name] = pipeline, iter(chunks)
 
         # Return the pipeline to allow expressions like
         # p = attach_pipeline(Pipeline(), 'name')
@@ -2325,8 +2475,6 @@ class TradingAlgorithm(object):
         :func:`zipline.api.attach_pipeline`
         :meth:`zipline.pipeline.engine.PipelineEngine.run_pipeline`
         """
-        # NOTE: We don't currently support multiple pipelines, but we plan to
-        # in the future.
         try:
             p, chunks = self._pipelines[name]
         except KeyError:
@@ -2334,20 +2482,21 @@ class TradingAlgorithm(object):
                 name=name,
                 valid=list(self._pipelines.keys()),
             )
-        return self._pipeline_output(p, chunks)
+        return self._pipeline_output(p, chunks, name)
 
-    def _pipeline_output(self, pipeline, chunks):
+    def _pipeline_output(self, pipeline, chunks, name):
         """
         Internal implementation of `pipeline_output`.
         """
         today = normalize_date(self.get_datetime())
         try:
-            data = self._pipeline_cache.unwrap(today)
-        except Expired:
+            data = self._pipeline_cache.get(name, today)
+        except KeyError:
+            # Calculate the next block.
             data, valid_until = self._run_pipeline(
                 pipeline, today, next(chunks),
             )
-            self._pipeline_cache = CachedObject(data, valid_until)
+            self._pipeline_cache.set(name, data, valid_until)
 
         # Now that we have a cached result, try to return the data for today.
         try:
